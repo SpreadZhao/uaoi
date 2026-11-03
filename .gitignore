@@ -1,0 +1,14 @@
+.direnv/
+.agents/
+.claude/
+.codex/
+.naw/
+/AGENTS.md
+/CLAUDE.md
+/target/
+/result
+/result-*
+/config.toml
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

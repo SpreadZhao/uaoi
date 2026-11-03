@@ -1,0 +1,23 @@
+# Default: ~/.config/uaoi/config.toml. These paths must be absolute if set.
+# state_dir = "/home/you/.local/state/uaoi"
+# runtime_dir = "/run/user/1000/uaoi"
+
+[im.telegram]
+token_env = "UAOI_TELEGRAM_TOKEN"
+group = -1001234567890
+allowed_users = [123456789]
+
+[agents.work]
+kind = "codex"
+# The same executable/profile used for the normal Codex CLI.
+command = ["/absolute/path/to/codex"]
+# env = { CODEX_HOME = "/home/you/.codex-work" }
+
+[projects.demo]
+workspace = "/path/to/project"
+agent = "work"
+
+# Every project's topics appear in the same configured Telegram group.
+[projects.other]
+workspace = "/path/to/other"
+agent = "work"
