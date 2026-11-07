@@ -1,28 +1,22 @@
 use super::*;
 use crate::agent::{codex::Codex, rpc::Rpc};
-use serde_json::json;
+use anyhow::Context;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-async fn wait_title(store: &Store, session: &Session, title: &str) -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while store.title(session).await? != title {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("Native title update was not observed")??;
-    Ok(())
-}
+
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires UAOI_TEST_CODEX; uses isolated home and mock model"]
-async fn native_lifecycle_and_shared_clients() -> Result<()> {
+#[ignore = "requires UAOI_TEST_CODEX; isolated home and loopback model only"]
+async fn native_shared_runtime_and_answers() -> Result<()> {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter("uaoi=debug")
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
         .try_init();
     let binary = std::env::var("UAOI_TEST_CODEX")?;
     let home = tempfile::tempdir()?;
     let cwd = home.path().join("work");
     let ch = home.path().join("codex");
+    let second_cwd = home.path().join("second-project");
+    std::fs::create_dir(&second_cwd)?;
     std::fs::create_dir_all(&cwd)?;
     std::fs::create_dir_all(&ch)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -69,11 +63,20 @@ async fn native_lifecycle_and_shared_clients() -> Result<()> {
                         .iter()
                         .skip(last + 1)
                         .any(|v| v["type"] == "function_call_output");
+                let prompt = input.get(last).map(Value::to_string).unwrap_or_default();
+                if prompt.contains("HOLD FOR STEER") {
+                    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                }
+                let plan_text = if prompt.contains("PLAN PROPOSAL") {
+                    "<proposed_plan>\n# A test plan\nRun the unit tests.\n</proposed_plan>"
+                } else {
+                    "MOCK ANSWER"
+                };
                 let id = uuid::Uuid::new_v4().to_string();
                 let item = if ask {
                     json!({"type":"function_call","call_id":format!("ask_{id}"),"name":"request_user_input","arguments":json!({"questions":[{"id":"choice","header":"Choice","question":"Choose a shared client","options":[{"label":"Terminal","description":"Answer locally"},{"label":"IM","description":"Answer remotely"}]}]}).to_string()})
                 } else {
-                    json!({"type":"message","role":"assistant","id":format!("msg_{id}"),"content":[{"type":"output_text","text":"MOCK ANSWER"}]})
+                    json!({"type":"message","role":"assistant","phase":"final_answer","id":format!("msg_{id}"),"content":[{"type":"output_text","text":plan_text}]})
                 };
                 let events = [
                     json!({"type":"response.created","response":{"id":id}}),
@@ -100,6 +103,7 @@ model_provider = "mock"
 approval_policy = "never"
 sandbox_mode = "read-only"
 check_for_update_on_startup = false
+thread_unload_delay_secs = 1
 [model_providers.mock]
 name = "Local mock"
 base_url = "http://127.0.0.1:{port}/v1"
@@ -118,401 +122,542 @@ trust_level = "trusted"
             cwd.display()
         ),
     )?;
-    let mut cfg = Config {
-        state_dir: Some(home.path().join("state")),
-        runtime_dir: Some(home.path().join("run")),
-        ..Config::default()
-    };
-    cfg.agents.insert(
-        "test".into(),
-        AgentSpec {
-            kind: "codex".into(),
-            command: vec![binary],
-            env: BTreeMap::from([
-                ("CODEX_HOME".into(), ch.display().to_string()),
-                ("OPENAI_API_KEY".into(), String::new()),
-                ("CODEX_SQLITE_HOME".into(), ch.display().to_string()),
-            ]),
-        },
+
+    let mut cfg = fake_config();
+    cfg.state_dir = Some(home.path().join("state"));
+    cfg.runtime_dir = Some(home.path().join("run"));
+    std::fs::create_dir_all(cfg.runtime())?;
+    let spec = cfg.agents.get_mut("work").unwrap();
+    spec.command = vec![binary];
+    spec.env = BTreeMap::from([
+        ("CODEX_HOME".into(), ch.display().to_string()),
+        ("OPENAI_API_KEY".into(), String::new()),
+        ("CODEX_SQLITE_HOME".into(), ch.display().to_string()),
+    ]);
+    let personal_home = home.path().join("personal");
+    std::fs::create_dir_all(&personal_home)?;
+    std::fs::copy(ch.join("config.toml"), personal_home.join("config.toml"))?;
+    let mut personal = cfg.agents["work"].clone();
+    personal.telegram.token_env = "PERSONAL_TEST_TOKEN".into();
+    personal
+        .env
+        .insert("CODEX_HOME".into(), personal_home.display().to_string());
+    personal.env.insert(
+        "CODEX_SQLITE_HOME".into(),
+        personal_home.display().to_string(),
     );
-    cfg.projects.insert(
-        "demo".into(),
-        Project {
-            workspace: cwd,
-            agent: "test".into(),
-        },
-    );
+    cfg.agents.insert("personal".into(), personal);
+    let mut second_project = cfg.projects["demo"].clone();
+    second_project.cwd = second_cwd.clone();
+    second_project.telegram.group = -1002;
+    cfg.projects.insert("second".into(), second_project);
+    cfg.projects.get_mut("demo").unwrap().cwd = cwd.clone();
+    cfg.projects
+        .get_mut("demo")
+        .unwrap()
+        .agents
+        .push("personal".into());
     let store = Store::open(&home.path().join("state.sqlite"))?;
     let (events, _) = tokio::sync::broadcast::channel(4096);
     let mut received = events.subscribe();
     let backend = Arc::new(Codex::new(
-        Arc::new(cfg),
+        Arc::new(cfg.clone()),
         store.clone(),
         events,
         cancel.clone(),
     ));
+    backend.start().await?;
+    let session = backend.create("work", &cwd).await?;
+    let initial_status = backend.status(&session).await?;
+    assert_eq!(initial_status.cwd, cwd);
+    assert_eq!(initial_status.mode, Some(SessionMode::Default));
+    assert_eq!(backend.toggle_plan_mode(&session).await?, SessionMode::Plan);
+    assert_eq!(
+        backend.toggle_plan_mode(&session).await?,
+        SessionMode::Default
+    );
+    assert!(
+        store
+            .native_session("work", &session.native)
+            .await?
+            .is_some(),
+        "explicit IM creation remains immediate"
+    );
+    backend.submit(&session, "FROM TELEGRAM", "first").await?;
+    wait_finished(&mut received, &session).await?;
     let plan = backend
-        .open(
-            "cli-a",
-            "demo",
-            &home.path().join("work"),
-            &std::env::vars().collect(),
-            &[
-                "--ask-for-approval".into(),
-                "never".into(),
-                "--sandbox".into(),
-                "workspace-write".into(),
-            ],
-        )
+        .open("cli-a", "work", &cwd, &std::env::vars().collect(), &[])
         .await?;
-    let path = std::path::Path::new(
+    let native = Rpc::open(std::path::Path::new(
         plan.command
-            .last()
-            .unwrap()
-            .strip_prefix("unix://")
-            .unwrap(),
-    );
-    let native = Rpc::open(path).await?;
-    native.initialize().await?;
-    let root = native
-        .request(
-            "thread/start",
-            json!({"cwd":plan.cwd,"approvalPolicy":"never","sandbox":"read-only"}),
-        )
-        .await?;
-    assert_eq!(root["approvalPolicy"], "never");
-    assert_eq!(root["sandbox"]["type"], "workspaceWrite");
-    let id = root["thread"]["id"].as_str().unwrap();
-    let s = store
-        .sessions()
-        .await?
-        .into_iter()
-        .find(|s| s.native == id)
-        .unwrap();
-    assert!(backend.active(&s).await);
-    native
-        .request(
-            "thread/name/set",
-            json!({"threadId":s.native,"name":"Initial title 中文"}),
-        )
-        .await?;
-    wait_title(&store, &s, "Initial title 中文").await?;
-    // Optional metadata projection into the dedicated Telegram test group.
-    // This does not poll the bot or touch any existing user session.
-    let title_worker = if let Ok(path) = std::env::var("UAOI_TEST_TELEGRAM_CONFIG") {
-        let cfg = Arc::new(Config::load(std::path::Path::new(&path))?);
-        let telegram = Arc::new(crate::im::telegram::Telegram::new(
-            cfg.im
-                .telegram
-                .clone()
-                .context("Missing Telegram test config")?,
-        )?);
-        telegram.validate().await?;
-        let svc = Arc::new(Service::new(
-            cfg,
-            store.clone(),
-            backend.clone(),
-            vec![telegram],
-        ));
-        svc.ensure_topics(&s).await?;
-        if let Ok(path) = std::env::var("UAOI_TEST_TITLE_RECEIPT") {
-            std::fs::write(path, serde_json::to_vec(&store.targets(&s.id).await?)?)?;
-        }
-        Some(tokio::spawn(svc.sync_titles(cancel.clone())))
-    } else {
-        None
-    };
-
-    backend.submit(&s, "FROM IM", "im-1", false).await?;
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if matches!(received.recv().await?.kind, EventKind::Finished) {
-                break;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    native.request("turn/start",json!({"threadId":s.native,"input":[{"type":"text","text":"FROM CLI","text_elements":[]}]})).await?;
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            let e = received.recv().await?;
-            if matches!(e.kind, EventKind::Finished) {
-                break;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    backend.history(&s).await?;
-    let history = store.history(&s.id, 100, 0).await?;
-    assert!(history.iter().any(|e| e.text.contains("FROM IM")));
-    assert!(history.iter().any(|e| e.text.contains("FROM CLI")));
-    native.request("thread/settings/update",json!({"threadId":s.native,"collaborationMode":{"mode":"plan","settings":{"model":"mock-model","reasoning_effort":null,"developer_instructions":null}}})).await?;
-    backend.submit(&s, "ASK SHARED", "ask", false).await?;
-    let request = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if let Some(request) = received.recv().await?.request {
-                break Ok::<_, anyhow::Error>(request);
-            }
-        }
-    })
-    .await??;
-    backend.respond(&s, &request.id, "IM").await?;
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        loop {
-            if matches!(received.recv().await?.kind, EventKind::Finished) {
-                break;
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    assert!(store.request(&request.id).await.is_err());
-    let before = store.sessions().await?.len();
-    let hidden = native
-        .request(
-            "thread/start",
-            json!({"cwd":plan.cwd,"ephemeral":true,"threadSource":"feature:thread_title","sandbox":"read-only"}),
-        )
-        .await?;
-    assert_eq!(
-        hidden["sandbox"]["type"], "readOnly",
-        "launch settings must not widen internal metadata threads"
-    );
-    assert!(backend.active(&s).await);
-    assert_eq!(
-        store.sessions().await?.len(),
-        before,
-        "hidden metadata threads must not become managed sessions"
-    );
-    native
-        .request(
-            "thread/unsubscribe",
-            json!({"threadId":hidden["thread"]["id"]}),
-        )
-        .await?;
-    // A failed navigation keeps the old connection active.
-    assert!(
-        native
-            .request(
-                "thread/resume",
-                json!({"threadId":"00000000-0000-0000-0000-000000000000"})
-            )
-            .await
-            .is_err()
-    );
-    assert!(backend.active(&s).await);
-    let second = native
-        .request("thread/start", json!({"cwd":plan.cwd}))
-        .await?;
-    let s2 = store
-        .sessions()
-        .await?
-        .into_iter()
-        .find(|s| s.native == second["thread"]["id"])
-        .unwrap();
-    assert!(!backend.active(&s).await);
-    assert!(backend.active(&s2).await);
-    native
-        .request(
-            "thread/name/set",
-            json!({"threadId":s.native,"name":"Renamed while offscreen"}),
-        )
-        .await?;
-    wait_title(&store, &s, "Renamed while offscreen").await?;
-    assert!(!backend.active(&s).await);
-    // Reconcile from a resume snapshot even if the name notification was missed.
-    store.set_title(&s, Some("Stale cached title")).await?;
-
-    assert!(
-        backend
-            .submit(&s, "OFFLINE", "offline", false)
-            .await
-            .is_err()
-    );
-    native
-        .request("thread/resume", json!({"threadId":s.native}))
-        .await?;
-    assert!(backend.active(&s).await);
-    assert!(!backend.active(&s2).await);
-    assert_eq!(store.title(&s).await?, "Renamed while offscreen");
-    let fork = native
-        .request("thread/fork", json!({"threadId":s.native}))
-        .await?;
-    let forked = store
-        .sessions()
-        .await?
-        .into_iter()
-        .find(|session| session.native == fork["thread"]["id"])
-        .context("Fork was not registered")?;
-    assert!(backend.active(&forked).await);
-    assert!(!backend.active(&s).await);
-    native
-        .request("thread/resume", json!({"threadId":s.native}))
-        .await?;
-    // A second terminal may use the same project but cannot join the same native writer.
-    let plan_b = backend
-        .open("cli-b", "demo", &plan.cwd, &std::env::vars().collect(), &[])
-        .await?;
-    let other = Rpc::open(std::path::Path::new(
-        plan_b
-            .command
             .last()
             .unwrap()
             .strip_prefix("unix://")
             .unwrap(),
     ))
     .await?;
-    other.initialize().await?;
+    native.initialize().await?;
+    native
+        .request(
+            "thread/resume",
+            json!({"threadId":session.native,"excludeTurns":true}),
+        )
+        .await
+        .context("resume existing thread through CLI gateway")?;
     assert!(
-        other
-            .request("thread/resume", json!({"threadId":s.native}))
+        native
+            .request("thread/start", json!({"cwd":home.path()}))
             .await
-            .unwrap_err()
-            .to_string()
-            .contains("another uaoi terminal")
+            .is_err(),
+        "CLI creation outside configured projects must be rejected"
     );
-    let third = other
-        .request("thread/start", json!({"cwd":plan.cwd}))
+    assert!(backend.create("work", home.path()).await.is_err());
+    let second = native
+        .request("thread/start", json!({"cwd":second_cwd}))
+        .await
+        .context("create blank thread through CLI gateway")?;
+    assert_ne!(session.native, second["thread"]["id"]);
+    assert_eq!(second["thread"]["cwd"], second_cwd.display().to_string());
+    assert_eq!(
+        std::fs::read_dir(cfg.runtime())?
+            .filter_map(Result::ok)
+            .filter(|p| p.path().join("engine.sock").exists())
+            .count(),
+        2,
+        "multiple projects reuse the agent's server"
+    );
+    let second_id = second["thread"]["id"].as_str().unwrap();
+    native
+        .request(
+            "thread/name/set",
+            json!({"threadId":second_id,"name":"Unsaved CLI draft"}),
+        )
         .await?;
-    let s3 = store
-        .sessions()
-        .await?
-        .into_iter()
-        .find(|s| s.native == third["thread"]["id"])
-        .unwrap();
-    backend.close("cli-b").await;
-    assert!(backend.active(&s).await);
-    assert!(!backend.active(&s3).await);
-    // Exercise the official terminal under a PTY, including /new navigation.
-    if let Ok(python) = std::env::var("UAOI_TEST_PYTHON") {
-        let script = home.path().join("terminal.py");
-        std::fs::write(&script, include_str!("terminal_fixture.py"))?;
-        let mut command = plan.command.clone();
-        command.extend(["resume".into(), s.native.clone()]);
-        let mut terminal = tokio::process::Command::new(python)
-            .arg(script)
-            .env("UAOI_TERMINAL_COMMAND", serde_json::to_string(&command)?)
-            .env("UAOI_TERMINAL_LOG", home.path().join("terminal.log"))
-            .envs(&plan.env)
-            .env("TERM", "xterm-256color")
-            .current_dir(&plan.cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        terminal
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(b"/rename CLI renamed title")
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        terminal.stdin.as_mut().unwrap().write_all(b"\r").await?;
-        wait_title(&store, &s, "CLI renamed title").await?;
-        terminal.stdin.as_mut().unwrap().write_all(b"/new").await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        terminal.stdin.as_mut().unwrap().write_all(b"\r").await?;
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            while backend.active(&s).await {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    native.request("thread/settings/update",json!({"threadId":second_id,"collaborationMode":{"mode":"plan","settings":{"model":"mock-model","reasoning_effort":null,"developer_instructions":null}}})).await?;
+    // Background supervision must not publish an empty CLI draft.
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    assert!(store.native_session("work", second_id).await?.is_none());
+    native.request("turn/start", json!({"threadId":second_id,"input":[{"type":"text","text":"FIRST REAL CLI INPUT PLAN PROPOSAL","text_elements":[]}]})).await?;
+    let promoted = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(s) = store.native_session("work", second_id).await? {
+                break Ok::<_, anyhow::Error>(s);
             }
-        })
-        .await
-        .context("TUI /new did not switch sessions")?;
-        terminal
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(format!("/resume {}", s.native).as_bytes())
-            .await?;
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        terminal.stdin.as_mut().unwrap().write_all(b"\r").await?;
-        tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            while !backend.active(&s).await {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .context("TUI /resume did not switch back")?;
-        drop(terminal.stdin.take());
-        tokio::time::timeout(std::time::Duration::from_secs(10), terminal.wait()).await??;
-    }
-    backend.close("cli-a").await;
-    assert!(!backend.active(&s).await);
-    assert!(!path.exists());
-    // Deliberately exit after version negotiation, before opening the socket.
-    use std::os::unix::fs::PermissionsExt;
-    let launcher = home.path().join("failing-launcher");
-    std::fs::write(
-        &launcher,
-        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.166.0'; exit 0; fi\nexit 7\n",
-    )?;
-    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700))?;
-    let mut broken = Config {
-        runtime_dir: Some(home.path().join("run")),
-        ..Config::default()
-    };
-    broken.agents.insert(
-        "test".into(),
-        AgentSpec {
-            kind: "codex".into(),
-            command: vec![launcher.display().to_string()],
-            env: BTreeMap::new(),
-        },
-    );
-    broken.projects.insert(
-        "demo".into(),
-        Project {
-            workspace: plan.cwd.clone(),
-            agent: "test".into(),
-        },
-    );
-    let (failed_events, _) = tokio::sync::broadcast::channel(16);
-    let failed = Codex::new(
-        Arc::new(broken),
-        store.clone(),
-        failed_events,
-        cancel.clone(),
-    );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    let initial_plan = wait_question(&mut received, RequestKind::Plan).await?;
+    wait_finished(&mut received, &promoted).await?;
+    backend.respond(&promoted, &initial_plan.id, "stay").await?;
+    let history = store.history(&promoted.id, 20, 0).await?;
     assert!(
-        failed
-            .open(
-                "failed-cli",
-                "demo",
-                &plan.cwd,
-                &std::env::vars().collect(),
-                &[]
+        history
+            .iter()
+            .any(|e| e.text == "FIRST REAL CLI INPUT PLAN PROPOSAL")
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Registered))
+            .count(),
+        1
+    );
+    let abandoned = native.request("thread/start", json!({"cwd":cwd})).await?;
+    assert!(
+        backend.active(&session).await,
+        "switching the CLI must not release the old session"
+    );
+    backend.close("cli-a").await;
+    assert!(
+        backend.active(&session).await,
+        "closing the CLI must not stop the server"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+    assert!(
+        store
+            .native_session("work", abandoned["thread"]["id"].as_str().unwrap())
+            .await?
+            .is_none()
+    );
+    backend
+        .submit(&promoted, "AFTER CLI EXIT", "promoted")
+        .await
+        .context("submit promoted thread after CLI exit")?;
+    wait_finished(&mut received, &promoted)
+        .await
+        .context("finish promoted thread after CLI exit")?;
+
+    backend
+        .submit(&session, "AFTER CLI EXIT", "after-exit")
+        .await?;
+    wait_finished(&mut received, &session).await?;
+    let plan = backend
+        .open("cli-b", "work", &cwd, &std::env::vars().collect(), &[])
+        .await?;
+    let cli = Rpc::open(std::path::Path::new(
+        plan.command
+            .last()
+            .unwrap()
+            .strip_prefix("unix://")
+            .unwrap(),
+    ))
+    .await?;
+    cli.initialize().await?;
+    cli.request(
+        "thread/resume",
+        json!({"threadId":session.native,"excludeTurns":true}),
+    )
+    .await?;
+    let mut mode_notices = cli.notices.subscribe();
+    backend.set_mode(&session, SessionMode::Plan).await?;
+    assert_eq!(
+        backend.status(&session).await?.mode,
+        Some(SessionMode::Plan)
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let notice = mode_notices.recv().await?;
+            if notice["method"] == "thread/settings/updated"
+                && notice["params"]["threadId"] == session.native
+            {
+                assert_eq!(
+                    notice["params"]["threadSettings"]["collaborationMode"]["mode"],
+                    "plan"
+                );
+                break Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    cli.request("thread/settings/update",json!({"threadId":session.native,"collaborationMode":{"mode":"default","settings":{"model":"mock-model","reasoning_effort":null,"developer_instructions":null}}})).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if backend.status(&session).await?.mode == Some(SessionMode::Default) {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(backend.toggle_plan_mode(&session).await?, SessionMode::Plan);
+    backend.submit(&session, "ASK SHARED", "ask").await?;
+    let request = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Some(r) = received.recv().await?.request {
+                break Ok::<_, anyhow::Error>(r);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(request.questions[0].options.len(), 2);
+    backend.respond(&session, &request.id, "IM").await?;
+    wait_finished(&mut received, &session).await?;
+    assert!(store.request(&request.id).await.is_err());
+    backend.history(&session).await?;
+    assert!(
+        store
+            .history(&session.id, 100, 0)
+            .await?
+            .iter()
+            .any(|e| e.text.contains("AFTER CLI EXIT"))
+    );
+    let mut cli_notices = cli.notices.subscribe();
+    backend.submit(&session, "ASK SHARED", "ask-cli").await?;
+    let request = wait_question(&mut received, RequestKind::Questions).await?;
+    let wire = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let v = cli_notices.recv().await?;
+            if v["method"] == "item/tool/requestUserInput" {
+                break Ok::<_, anyhow::Error>(v);
+            }
+        }
+    })
+    .await??;
+    cli.send(json!({"id":wire["id"],"result":{"answers":{"choice":{"answers":["Terminal"]}}}}))
+        .await?;
+    wait_finished(&mut received, &session).await?;
+    assert!(store.request(&request.id).await.is_err());
+    assert!(
+        store
+            .history(&session.id, 100, 0)
+            .await?
+            .iter()
+            .any(|e| e.text.contains("Answer submitted via CLI") && e.text.contains("Terminal"))
+    );
+    backend
+        .submit(&session, "PLAN PROPOSAL", "plan-stay")
+        .await?;
+    let stay = wait_question(&mut received, RequestKind::Plan).await?;
+    wait_finished(&mut received, &session).await?;
+    assert_eq!(
+        stay.choices
+            .iter()
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>(),
+        vec!["execute", "stay"]
+    );
+    backend.respond(&session, &stay.id, "stay").await?;
+    assert!(!backend.busy().await);
+    assert!(
+        backend
+            .respond(&session, &stay.id, "execute")
+            .await
+            .is_err()
+    );
+    backend
+        .submit(&session, "PLAN PROPOSAL", "plan-execute")
+        .await?;
+    let execute = wait_question(&mut received, RequestKind::Plan).await?;
+    wait_finished(&mut received, &session).await?;
+    backend.respond(&session, &execute.id, "execute").await?;
+    wait_finished(&mut received, &session).await?;
+    assert_eq!(
+        backend.status(&session).await?.mode,
+        Some(SessionMode::Default)
+    );
+    backend
+        .submit_in_mode(&session, "PLAN PROPOSAL", "inline-plan", SessionMode::Plan)
+        .await?;
+    let inline_plan = wait_question(&mut received, RequestKind::Plan).await?;
+    wait_finished(&mut received, &session).await?;
+    assert_eq!(
+        backend.status(&session).await?.mode,
+        Some(SessionMode::Plan)
+    );
+    backend.respond(&session, &inline_plan.id, "stay").await?;
+    backend
+        .submit_in_mode(
+            &session,
+            "DEFAULT TASK",
+            "inline-default",
+            SessionMode::Default,
+        )
+        .await?;
+    wait_finished(&mut received, &session).await?;
+    backend.submit(&session, "HOLD FOR STEER", "hold").await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let state = cli
+                .request(
+                    "thread/read",
+                    json!({"threadId":session.native,"includeTurns":false}),
+                )
+                .await?;
+            if state["thread"]["status"]["type"] == "active" {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert!(backend.busy().await);
+    assert!(backend.working(&session).await);
+    assert!(
+        backend
+            .submit_in_mode(
+                &session,
+                "REJECTED INLINE PLAN",
+                "busy-plan",
+                SessionMode::Plan
             )
             .await
             .is_err()
     );
     assert_eq!(
-        std::fs::read_dir(home.path().join("run"))?.count(),
-        0,
-        "failed startup left runtime resources"
+        backend.status(&session).await?.mode,
+        Some(SessionMode::Default)
     );
-    if title_worker.is_some() {
-        let expected = store.title(&s).await?;
-        tokio::time::timeout(std::time::Duration::from_secs(30),async {
-            loop {
-                let db=rusqlite::Connection::open(home.path().join("state.sqlite"))?;
-                let pending:i64=db.query_row("SELECT count(*) FROM conversation_titles WHERE desired<>applied OR applied IS NULL",[],|r|r.get(0))?;
-                if pending==0 {break;}
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            Ok::<_,anyhow::Error>(())
-        }).await.context("Telegram title did not converge")??;
-        eprintln!("Live Telegram topic title converged: {expected}");
+    assert_eq!(backend.toggle_plan_mode(&session).await?, SessionMode::Plan);
+    assert!(
+        backend.working(&session).await,
+        "mode-only changes must not interrupt the active turn"
+    );
+    assert_eq!(
+        backend.toggle_plan_mode(&session).await?,
+        SessionMode::Default
+    );
+    backend.submit(&session, "STEER ADDITION", "steer").await?;
+    wait_finished(&mut received, &session).await?;
+    assert!(!backend.working(&session).await);
+    backend.history(&session).await?;
+    assert!(
+        store
+            .history(&session.id, 100, 0)
+            .await?
+            .iter()
+            .any(|e| e.text.contains("STEER ADDITION"))
+    );
+    let personal = backend.create("personal", &cwd).await?;
+    backend
+        .submit(&personal, "PERSONAL ONLY", "personal")
+        .await?;
+    wait_finished(&mut received, &personal).await?;
+    assert!(backend.restore("work", &personal.native).await.is_err());
+    let terminal = backend
+        .open("real-tui", "work", &cwd, &std::env::vars().collect(), &[])
+        .await?;
+    run_terminal(&terminal, &session.native).await?;
+    backend.close("real-tui").await;
+    assert!(backend.active(&session).await);
+    backend
+        .submit(&session, "AFTER REAL TUI", "post-tui")
+        .await?;
+    wait_finished(&mut received, &session).await?;
+
+    // Seed native history outside the gateway. Neither its existence nor a CLI
+    // resume may create a binding, even when its cwd is outside prior sessions.
+    let mut engine = None;
+    for entry in std::fs::read_dir(cfg.runtime())? {
+        let path = entry?.path().join("engine.sock");
+        if !path.exists() {
+            continue;
+        }
+        let rpc = Rpc::open(&path).await?;
+        rpc.initialize().await?;
+        if rpc
+            .request(
+                "thread/read",
+                json!({"threadId":session.native,"includeTurns":false}),
+            )
+            .await
+            .is_ok()
+        {
+            engine = Some(rpc);
+            break;
+        }
     }
-    cancel.cancel();
+    let engine = engine.context("work agent engine not found")?;
+    let other_cwd = home.path().join("another-directory");
+    std::fs::create_dir(&other_cwd)?;
+    let unbound = engine
+        .request("thread/start", json!({"cwd":other_cwd}))
+        .await?;
+    let unbound_id = unbound["thread"]["id"].as_str().unwrap();
+    assert!(
+        cli.request("thread/fork", json!({"threadId":unbound_id}))
+            .await
+            .is_err(),
+        "fork must validate the inherited cwd"
+    );
+    let mut engine_notices = engine.notices.subscribe();
+    engine.request("turn/start", json!({"threadId":unbound_id,"input":[{"type":"text","text":"UNBOUND SEED","text_elements":[]}]})).await?;
+    wait_native_finished(&mut engine_notices, unbound_id).await?;
+    cli.request(
+        "thread/resume",
+        json!({"threadId":unbound_id,"excludeTurns":true}),
+    )
+    .await?;
+    cli.request("turn/start", json!({"threadId":unbound_id,"input":[{"type":"text","text":"HOLD FOR STEER","text_elements":[]}]})).await?;
+    assert!(
+        backend.busy().await,
+        "unbound native work also prevents shutdown"
+    );
+    assert!(store.native_session("work", unbound_id).await?.is_none());
+    wait_native_finished(&mut engine_notices, unbound_id).await?;
+    assert!(store.native_session("work", unbound_id).await?.is_none());
+    assert!(!backend.busy().await);
+    backend.close("cli-b").await;
     backend.shutdown().await;
-    if let Some(worker) = title_worker {
-        worker.await?;
-    }
-    server.await?;
+    cancel.cancel();
+    server.abort();
+    Ok(())
+}
+async fn wait_native_finished(
+    rx: &mut tokio::sync::broadcast::Receiver<Value>,
+    native: &str,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let event = rx.recv().await?;
+            if event["method"] == "turn/completed" && event["params"]["threadId"] == native {
+                break Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    Ok(())
+}
+async fn wait_finished(
+    rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
+    session: &Session,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let event = rx.recv().await?;
+            if event.session == session.id && matches!(event.kind, EventKind::Finished) {
+                break Ok::<_, anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    Ok(())
+}
+
+async fn wait_question(
+    rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
+    kind: RequestKind,
+) -> Result<PendingRequest> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Some(r) = rx.recv().await?.request
+                && r.kind == kind
+            {
+                break Ok::<_, anyhow::Error>(r);
+            }
+        }
+    })
+    .await?
+}
+
+async fn run_terminal(plan: &LaunchPlan, session: &str) -> Result<()> {
+    let script = r#"
+import os,sys,json,pty,fcntl,termios,struct,select,time,signal
+command=json.loads(sys.argv[1])+['resume',sys.argv[2]]
+pid,fd=pty.fork()
+if pid==0:
+    os.environ['TERM']='xterm-256color'
+    os.execv(command[0],command)
+fcntl.ioctl(fd,termios.TIOCSWINSZ,struct.pack('HHHH',40,120,0,0))
+output=bytearray()
+def pump(seconds):
+    until=time.monotonic()+seconds
+    while time.monotonic()<until:
+        if not select.select([fd],[],[],.05)[0]:continue
+        try:data=os.read(fd,65536)
+        except OSError:return
+        if not data:return
+        output.extend(data)
+        for query,answer in [(b'\x1b[6n',b'\x1b[1;1R'),(b'\x1b[c',b'\x1b[?1;2c'),(b'\x1b]10;?',b'\x1b]10;rgb:ffff/ffff/ffff\x1b\\'),(b'\x1b]11;?',b'\x1b]11;rgb:0000/0000/0000\x1b\\')]:
+            if query in data:os.write(fd,answer)
+try:
+    pump(2)
+    os.write(fd,b'FROM REAL TUI')
+    pump(.2)
+    os.write(fd,b'\r')
+    end=time.monotonic()+20
+    while b'MOCK ANSWER' not in output and time.monotonic()<end:pump(.1)
+    assert b'MOCK ANSWER' in output,output[-3000:].decode(errors='replace')
+    os.write(fd,b'/agents');pump(.2);os.write(fd,b'\r');pump(.8)
+    assert b'Manage' in output or b'Agent' in output or b'agent' in output
+finally:
+    os.kill(pid,signal.SIGTERM)
+    os.waitpid(pid,0)
+    os.close(fd)
+"#;
+    let status = tokio::process::Command::new(
+        std::env::var("UAOI_TEST_PYTHON").unwrap_or_else(|_| "python3".into()),
+    )
+    .args([
+        "-c",
+        script,
+        &serde_json::to_string(&plan.command)?,
+        session,
+    ])
+    .envs(&plan.env)
+    .current_dir(&plan.cwd)
+    .status()
+    .await?;
+    anyhow::ensure!(status.success(), "Native TUI integration failed");
     Ok(())
 }

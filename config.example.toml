@@ -1,23 +1,39 @@
-# Default: ~/.config/uaoi/config.toml. These paths must be absolute if set.
-# state_dir = "/home/you/.local/state/uaoi"
+# Version 3 requires fresh state. Older configuration and state are rejected.
+version = 3
+# state_dir = "/home/you/.local/state/uaoi-v3"
 # runtime_dir = "/run/user/1000/uaoi"
 
-[im.telegram]
-token_env = "UAOI_TELEGRAM_TOKEN"
+# Each agent has a distinct Bot and native profile/server.
+# Every CLI invocation selects its agent explicitly with --agent NAME.
+[agents.work]
+kind = "codex"
+command = ["/absolute/path/to/codex-work"]
+output = "compact" # compact or verbose; configuration only
+# env = { CODEX_HOME = "/home/you/.codex-work" }
+[agents.work.telegram]
+token_env = "UAOI_WORK_BOT_TOKEN"
+
+[agents.personal]
+kind = "codex"
+command = ["/absolute/path/to/codex-personal"]
+output = "compact"
+# env = { CODEX_HOME = "/home/you/.codex-personal" }
+[agents.personal.telegram]
+token_env = "UAOI_PERSONAL_BOT_TOKEN"
+
+# Create forum groups manually, add the listed Bots, and grant Manage Topics.
+# cwd must be an existing absolute directory; matching uses its canonical path.
+[projects.uaoi]
+cwd = "/home/you/workspaces/uaoi"
+agents = ["work", "personal"]
+[projects.uaoi.telegram]
 group = -1001234567890
 allowed_users = [123456789]
 
-[agents.work]
-kind = "codex"
-# The same executable/profile used for the normal Codex CLI.
-command = ["/absolute/path/to/codex"]
-# env = { CODEX_HOME = "/home/you/.codex-work" }
-
-[projects.demo]
-workspace = "/path/to/project"
-agent = "work"
-
-# Every project's topics appear in the same configured Telegram group.
-[projects.other]
-workspace = "/path/to/other"
-agent = "work"
+# Agents can share their server across several projects.
+[projects.website]
+cwd = "/home/you/workspaces/website"
+agents = ["work"]
+[projects.website.telegram]
+group = -1009876543210
+allowed_users = [123456789]

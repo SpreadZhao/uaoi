@@ -12,7 +12,11 @@ pub enum SendFailure {
 #[async_trait]
 pub trait ImAdapter: Send + Sync {
     fn name(&self) -> &str;
-    fn space(&self) -> Conversation;
+    fn spaces(&self) -> Vec<Conversation>;
+    fn agent(&self) -> &str;
+    fn project(&self, target: &Conversation) -> Option<&str>;
+    fn destination(&self, project: &str) -> Option<Conversation>;
+    fn topic(&self, project: &str, id: &str) -> Result<Conversation>;
     async fn discard_backlog(&self) -> Result<String>;
     async fn poll(&self, cursor: &str) -> Result<(Vec<Inbound>, String)>;
     async fn create_conversation(&self, space: &Conversation, title: &str) -> Result<Conversation>;
@@ -22,5 +26,15 @@ pub trait ImAdapter: Send + Sync {
         title: &str,
     ) -> std::result::Result<(), SendFailure>;
     async fn deliver(&self, delivery: &Delivery) -> std::result::Result<String, SendFailure>;
-    fn authorized(&self, sender: &str) -> bool;
+    async fn indicate_working(&self, _target: &Conversation) -> Result<()> {
+        Ok(())
+    }
+    async fn acknowledge(&self, _input: &Inbound, _feedback: Option<&str>) -> Result<()> {
+        Ok(())
+    }
+    async fn set_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
+        Ok(())
+    }
+    fn authorized(&self, sender: &str, target: &Conversation) -> bool;
+    fn link(&self, target: &Conversation) -> String;
 }

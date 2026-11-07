@@ -1,22 +1,83 @@
 use crate::{
     agent::AgentAdapter,
-    config::{AgentSpec, Config, Project},
+    config::{AgentSpec, Config, OutputMode, ProjectSpec, ProjectTelegram, TelegramConfig},
     im::{ImAdapter, SendFailure},
     model::*,
     service::Service,
     store::Store,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
+#[derive(Default)]
 struct FakeAgent {
     online: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
+    submitted: Mutex<Vec<String>>,
+    responses: Mutex<Vec<String>>,
+    store: Option<Store>,
+    listed: Mutex<Vec<SessionSummary>>,
+    management: Mutex<Vec<serde_json::Value>>,
+    modes: Mutex<BTreeMap<String, SessionMode>>,
+    unavailable: Vec<String>,
 }
 #[async_trait]
 impl AgentAdapter for FakeAgent {
+    async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn describe(&self, session: &Session) -> Result<SessionSummary> {
+        Ok(self
+            .listed
+            .lock()
+            .await
+            .iter()
+            .find(|s| s.native == session.native)
+            .cloned()
+            .unwrap_or(SessionSummary {
+                native: session.native.clone(),
+                title: session.native.clone(),
+                cwd: "/tmp".into(),
+                status: if self.online.lock().await.contains(&session.id) {
+                    "active"
+                } else {
+                    "idle"
+                }
+                .into(),
+            }))
+    }
+    async fn restore(&self, agent: &str, native: &str) -> Result<Session> {
+        anyhow::ensure!(
+            !self.unavailable.iter().any(|id| id == native),
+            "Session unavailable"
+        );
+        self.management
+            .lock()
+            .await
+            .push(serde_json::json!({"op":"restore","agent":agent,"native":native}));
+        self.store
+            .as_ref()
+            .unwrap()
+            .ensure_session(agent, native)
+            .await
+    }
+    async fn create(&self, agent: &str, cwd: &std::path::Path) -> Result<Session> {
+        self.management
+            .lock()
+            .await
+            .push(serde_json::json!({"op":"create","agent":agent,"cwd":cwd}));
+        self.store
+            .as_ref()
+            .unwrap()
+            .ensure_session(agent, &uuid::Uuid::new_v4().to_string())
+            .await
+    }
+    async fn busy(&self) -> bool {
+        false
+    }
+
     async fn open(
         &self,
         _: &str,
@@ -34,28 +95,79 @@ impl AgentAdapter for FakeAgent {
     async fn active(&self, s: &Session) -> bool {
         self.online.lock().await.contains(&s.id)
     }
-    async fn accepts(&self, s: &Session, date: u64) -> bool {
-        self.active(s).await && date > 100
+    async fn working(&self, s: &Session) -> bool {
+        self.active(s).await
     }
-    async fn submit(&self, _: &Session, t: &str, _: &str, steer: bool) -> Result<()> {
+    async fn submit(&self, session: &Session, t: &str, _: &str) -> Result<()> {
         if t == "uncertain" {
             return Err(crate::agent::OutcomeUnknown("connection lost".into()).into());
         }
-        anyhow::ensure!(!steer, "No active turn to steer");
         self.inputs.lock().await.push(t.into());
+        self.submitted.lock().await.push(session.id.clone());
         Ok(())
+    }
+    async fn set_mode(&self, session: &Session, mode: SessionMode) -> Result<()> {
+        self.modes.lock().await.insert(session.id.clone(), mode);
+        Ok(())
+    }
+    async fn toggle_plan_mode(&self, session: &Session) -> Result<SessionMode> {
+        let mut modes = self.modes.lock().await;
+        let mode = match modes
+            .get(&session.id)
+            .copied()
+            .unwrap_or(SessionMode::Default)
+        {
+            SessionMode::Default => SessionMode::Plan,
+            SessionMode::Plan => SessionMode::Default,
+        };
+        modes.insert(session.id.clone(), mode);
+        Ok(mode)
+    }
+    async fn submit_in_mode(
+        &self,
+        session: &Session,
+        text: &str,
+        input_id: &str,
+        mode: SessionMode,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.online.lock().await.contains(&session.id),
+            "A turn is running"
+        );
+        self.set_mode(session, mode).await?;
+        self.submit(session, text, input_id).await
     }
     async fn interrupt(&self, _: &Session) -> Result<()> {
         Ok(())
     }
-    async fn respond(&self, _: &Session, _: &str, _: &str) -> Result<()> {
+    async fn respond(&self, _: &Session, _: &str, answer: &str) -> Result<()> {
+        self.responses.lock().await.push(answer.into());
+        if answer.contains("uncertain-answer") {
+            return Err(crate::agent::OutcomeUnknown("connection lost".into()).into());
+        }
         Ok(())
     }
     async fn history(&self, _: &Session) -> Result<()> {
         Ok(())
     }
-    async fn status(&self, _: &Session) -> Result<String> {
-        Ok("idle".into())
+    async fn status(&self, session: &Session) -> Result<SessionStatus> {
+        Ok(SessionStatus {
+            cwd: "/tmp".into(),
+            state: if self.online.lock().await.contains(&session.id) {
+                "active"
+            } else {
+                "idle"
+            }
+            .into(),
+            mode: Some(
+                self.modes
+                    .lock()
+                    .await
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(SessionMode::Default),
+            ),
+        })
     }
     async fn shutdown(&self) {}
 }
@@ -65,15 +177,35 @@ impl ImAdapter for FakeIm {
     fn name(&self) -> &str {
         "test"
     }
-    fn space(&self) -> Conversation {
-        Conversation {
+    fn spaces(&self) -> Vec<Conversation> {
+        vec![Conversation {
             platform: "test".into(),
-            space: "group".into(),
+            space: "-1001".into(),
             thread: String::new(),
-        }
+        }]
     }
-    fn authorized(&self, id: &str) -> bool {
-        id == "1"
+    fn authorized(&self, id: &str, t: &Conversation) -> bool {
+        ["1", "3"].contains(&id) && t.space == "-1001"
+    }
+    fn agent(&self) -> &str {
+        "work"
+    }
+    fn project(&self, t: &Conversation) -> Option<&str> {
+        (t.space == "-1001").then_some("demo")
+    }
+    fn destination(&self, agent: &str) -> Option<Conversation> {
+        (agent == "demo").then(|| self.spaces().remove(0))
+    }
+    fn topic(&self, agent: &str, id: &str) -> Result<Conversation> {
+        Ok(Conversation {
+            thread: id.into(),
+            ..self
+                .destination(agent)
+                .ok_or_else(|| anyhow::anyhow!("Unknown agent"))?
+        })
+    }
+    fn link(&self, t: &Conversation) -> String {
+        format!("test:{}", t.thread)
     }
     async fn discard_backlog(&self) -> Result<String> {
         Ok(String::new())
@@ -100,84 +232,138 @@ impl ImAdapter for FakeIm {
 }
 fn message(id: &str, t: &Conversation, text: &str) -> Inbound {
     Inbound {
+        agent: "work".into(),
+        addressed: false,
         id: id.into(),
         sender: "1".into(),
         target: t.clone(),
         text: text.into(),
         conversation_created: false,
         action: None,
-        sent_at: 200,
+        acknowledgement: None,
+        reply_to: None,
+        sent_at: u64::MAX,
+    }
+}
+fn card_action(card: &Delivery, label: &str) -> String {
+    card.buttons
+        .iter()
+        .flat_map(|row| row.iter())
+        .find(|(text, _)| text == label)
+        .unwrap_or_else(|| panic!("Missing button {label}: {}", card.text))
+        .1
+        .clone()
+}
+async fn question_card(store: &Store, request: &str) -> Result<Delivery> {
+    Ok(store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key.contains(&format!(":request:{request}:")))
+        .expect("Question card"))
+}
+async fn click_card(svc: &Service, card: &Delivery, id: &str, label: &str) -> Result<()> {
+    let mut input = message(id, &card.target, "");
+    input.action = Some(card_action(card, label));
+    svc.handle(input).await
+}
+fn fake_config() -> Config {
+    Config {
+        version: 3,
+        projects: BTreeMap::from([(
+            "demo".into(),
+            ProjectSpec {
+                cwd: "/tmp".into(),
+                agents: vec!["work".into()],
+                telegram: ProjectTelegram {
+                    group: -1001,
+                    allowed_users: vec![1, 3],
+                },
+            },
+        )]),
+        agents: BTreeMap::from([(
+            "work".into(),
+            AgentSpec {
+                kind: "codex".into(),
+                command: vec!["codex".into()],
+                env: BTreeMap::new(),
+                telegram: TelegramConfig {
+                    token_env: "TEST_TOKEN".into(),
+                },
+                output: OutputMode::Compact,
+            },
+        )]),
+        ..Config::default()
     }
 }
 #[tokio::test]
-async fn single_group_topics_offline_reuse_and_rejections() -> Result<()> {
+async fn group_topics_and_deduplication() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(&dir.path().join("state.sqlite"))?;
     let agent = Arc::new(FakeAgent {
         online: Mutex::new(vec![]),
         inputs: Mutex::new(vec![]),
+        responses: Mutex::new(vec![]),
+        ..Default::default()
     });
     let svc = Service::new(
-        Arc::new(Config::default()),
+        Arc::new(fake_config()),
         store.clone(),
         agent.clone(),
         vec![Arc::new(FakeIm)],
     );
-    let a = store.ensure_session("a", "work", "native-a").await?;
-    let b = store.ensure_session("b", "work", "native-b").await?;
+    let a = store.ensure_session("work", "native-a").await?;
+    let b = store.ensure_session("work", "native-b").await?;
     svc.ensure_topics(&a).await?;
     svc.ensure_topics(&b).await?;
     let ta = store.targets(&a.id).await?.remove(0);
     let tb = store.targets(&b.id).await?.remove(0);
-    assert_eq!(ta.space, tb.space);
     assert_ne!(ta.thread, tb.thread);
-    agent
-        .online
-        .lock()
-        .await
-        .extend([a.id.clone(), b.id.clone()]);
     svc.handle(message("a1", &ta, "first")).await?;
     svc.handle(message("a1", &ta, "first")).await?;
     svc.handle(message("b1", &tb, "second")).await?;
-    svc.handle(message("bad-steer", &ta, "/steer nope")).await?;
-    assert!(store.recovery().await?.as_array().unwrap().is_empty());
-    assert!(
-        store
-            .unconsumed(&a.id)
-            .await?
-            .to_string()
-            .find("nope")
-            .is_none()
-    );
-    agent.online.lock().await.retain(|id| id != &a.id);
-    svc.handle(message("offline", &ta, "must not run")).await?;
-    agent.online.lock().await.push(a.id.clone());
-    let mut old = message("old", &ta, "stale");
-    old.sent_at = 90;
-    svc.handle(old).await?;
-    svc.ensure_topics(&a).await?;
-    assert_eq!(store.targets(&a.id).await?, vec![ta.clone()]);
-    let mut unauthorized = message("bad-user", &ta, "evil");
+    let mut unauthorized = message("evil", &ta, "evil");
     unauthorized.sender = "2".into();
     svc.handle(unauthorized).await?;
-    svc.handle(message("uncertain", &ta, "uncertain")).await?;
-    assert!(store.recovery().await?.to_string().contains("uncertain"));
-    assert!(
-        store
-            .unconsumed(&a.id)
-            .await?
-            .to_string()
-            .contains("unknown")
-    );
     assert_eq!(*agent.inputs.lock().await, vec!["first", "second"]);
+    svc.ensure_topics(&a).await?;
+    assert_eq!(store.targets(&a.id).await?, vec![ta]);
     Ok(())
 }
+
 #[test]
 fn rejects_old_database_and_config() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("old.sqlite");
     rusqlite::Connection::open(&path)?.execute("CREATE TABLE spaces(id TEXT)", [])?;
     assert!(Store::open(&path).is_err());
+    for version in [3, 4] {
+        let path = dir.path().join(format!("v{version}.sqlite"));
+        let db = rusqlite::Connection::open(&path)?;
+        db.pragma_update(None, "user_version", version)?;
+        assert!(Store::open(&path).is_err());
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))?,
+            version
+        );
+    }
+    let config = dir.path().join("config.toml");
+    let mut cfg = fake_config();
+    for version in [1, 2] {
+        cfg.version = version;
+        std::fs::write(&config, toml::to_string(&cfg)?)?;
+        assert!(Config::load(&config).is_err());
+    }
+    cfg.version = 3;
+    std::fs::write(&config, toml::to_string(&cfg)?)?;
+    Config::load(&config)?;
+    let mut old = toml::Value::try_from(cfg)?;
+    old["agents"]["work"]
+        .as_table_mut()
+        .unwrap()
+        .insert("workspaces".into(), toml::Value::Table(Default::default()));
+    std::fs::write(&config, toml::to_string(&old)?)?;
+    assert!(Config::load(&config).is_err());
     assert!(
         toml::from_str::<Config>("[projects.a]\nworkspace='/'\nagent='a'\napproval_policy='never'")
             .is_err()
@@ -185,22 +371,9 @@ fn rejects_old_database_and_config() -> Result<()> {
     Ok(())
 }
 #[test]
-fn wrapper_arguments_and_project_resolution() -> Result<()> {
+fn wrapper_arguments_and_agent_selection() -> Result<()> {
     use crate::agent::codex_cli::invocation;
     let dir = tempfile::tempdir()?;
-    let nested = dir.path().join("nested");
-    std::fs::create_dir(&nested)?;
-    let mut cfg = Config::default();
-    for (name, path) in [("root", dir.path()), ("child", nested.as_path())] {
-        cfg.projects.insert(
-            name.into(),
-            Project {
-                workspace: path.into(),
-                agent: "a".into(),
-            },
-        );
-    }
-    assert_eq!(cfg.project(&nested)?.0, "child");
     let parse = |args: &[&str]| {
         invocation(
             &args
@@ -210,16 +383,20 @@ fn wrapper_arguments_and_project_resolution() -> Result<()> {
             dir.path(),
         )
     };
-    assert_eq!(
-        parse(&["--model", "exec", "-C", "nested", "resume", "--last"])?,
-        (true, nested.clone())
-    );
+    assert!(parse(&["agents"])?.0);
     assert!(!parse(&["exec", "--help"])?.0);
-    assert!(!parse(&["--model=x", "exec", "hello"])?.0);
-    assert!(parse(&["--", "--remote"])?.0);
     assert!(parse(&["--remote", "unix://other"]).is_err());
+    assert!(parse(&["--no-daemon"]).is_err());
+    let mut cfg = fake_config();
+    assert!(cfg.select_agent(None).is_err());
+    assert_eq!(cfg.select_agent(Some("work"))?, "work");
+    cfg.agents
+        .insert("personal".into(), cfg.agents["work"].clone());
+    assert!(cfg.select_agent(None).is_err());
+    assert_eq!(cfg.select_agent(Some("personal"))?, "personal");
     Ok(())
 }
+
 #[tokio::test]
 async fn large_frames_are_bounded() -> Result<()> {
     use crate::agent::rpc;
@@ -263,6 +440,8 @@ async fn large_frames_are_bounded() -> Result<()> {
 }
 #[path = "native_tests.rs"]
 mod native_tests;
+#[path = "project_tests.rs"]
+mod project_tests;
 
 #[test]
 fn output_preserves_lines_and_unicode() {
@@ -339,17 +518,33 @@ struct TitleIm {
     created: Mutex<Vec<String>>,
     renamed: Mutex<Vec<String>>,
     fail_once: std::sync::atomic::AtomicBool,
+    working: Mutex<Vec<Conversation>>,
 }
 #[async_trait]
 impl ImAdapter for TitleIm {
     fn name(&self) -> &str {
         FakeIm.name()
     }
-    fn space(&self) -> Conversation {
-        FakeIm.space()
+    fn spaces(&self) -> Vec<Conversation> {
+        FakeIm.spaces()
     }
-    fn authorized(&self, id: &str) -> bool {
-        FakeIm.authorized(id)
+    fn authorized(&self, id: &str, target: &Conversation) -> bool {
+        FakeIm.authorized(id, target)
+    }
+    fn agent(&self) -> &str {
+        FakeIm.agent()
+    }
+    fn project(&self, t: &Conversation) -> Option<&str> {
+        FakeIm.project(t)
+    }
+    fn destination(&self, agent: &str) -> Option<Conversation> {
+        FakeIm.destination(agent)
+    }
+    fn topic(&self, agent: &str, id: &str) -> Result<Conversation> {
+        FakeIm.topic(agent, id)
+    }
+    fn link(&self, target: &Conversation) -> String {
+        FakeIm.link(target)
     }
     async fn discard_backlog(&self) -> Result<String> {
         FakeIm.discard_backlog().await
@@ -378,6 +573,10 @@ impl ImAdapter for TitleIm {
     async fn deliver(&self, d: &Delivery) -> std::result::Result<String, SendFailure> {
         FakeIm.deliver(d).await
     }
+    async fn indicate_working(&self, target: &Conversation) -> Result<()> {
+        self.working.lock().await.push(target.clone());
+        Ok(())
+    }
 }
 #[tokio::test]
 async fn title_sync_creation_latest_retry_and_restart() -> Result<()> {
@@ -385,17 +584,17 @@ async fn title_sync_creation_latest_retry_and_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("state.sqlite");
     let store = Store::open(&path)?;
-    let s = store
-        .ensure_session("demo", "codex", "native-title")
-        .await?;
+    let s = store.ensure_session("work", "native-title").await?;
     store.set_title(&s, Some("Existing session title")).await?;
     let im = Arc::new(TitleIm::default());
     let agent = Arc::new(FakeAgent {
         online: Mutex::new(vec![]),
         inputs: Mutex::new(vec![]),
+        responses: Mutex::new(vec![]),
+        ..Default::default()
     });
     let svc = Arc::new(Service::new(
-        Arc::new(Config::default()),
+        Arc::new(fake_config()),
         store.clone(),
         agent.clone(),
         vec![im.clone()],
@@ -435,12 +634,13 @@ async fn title_sync_creation_latest_retry_and_restart() -> Result<()> {
     assert_eq!(
         reopened.pending_titles().await?,
         vec![TitleChange {
+            agent: "work".into(),
             target: target.clone(),
             title: "After restart".into()
         }]
     );
     let svc = Arc::new(Service::new(
-        Arc::new(Config::default()),
+        Arc::new(fake_config()),
         reopened.clone(),
         agent,
         vec![im.clone()],
@@ -464,9 +664,9 @@ async fn title_sync_creation_latest_retry_and_restart() -> Result<()> {
 async fn title_sync_handles_updates_during_api_calls() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(&dir.path().join("state.sqlite"))?;
-    let a = store.ensure_session("a", "codex", "native-a").await?;
-    let b = store.ensure_session("b", "codex", "native-b").await?;
-    let mut ta = FakeIm.space();
+    let a = store.ensure_session("work", "native-a").await?;
+    let b = store.ensure_session("work", "native-b").await?;
+    let mut ta = FakeIm.spaces().remove(0);
     ta.thread = "1".into();
     let mut tb = ta.clone();
     tb.thread = "2".into();
@@ -474,6 +674,7 @@ async fn title_sync_handles_updates_during_api_calls() -> Result<()> {
     store.bind(&ta, &a.id).await?;
     store.bind(&tb, &b.id).await?;
     let original = TitleChange {
+        agent: "work".into(),
         target: ta.clone(),
         title: "A".into(),
     };
@@ -496,7 +697,785 @@ async fn title_sync_handles_updates_during_api_calls() -> Result<()> {
         .await?;
     assert!(store.title_is_current(&original).await?);
     store.set_title(&a, None).await?;
-    assert_eq!(store.title(&a).await?, "[a] native-a");
-    assert_eq!(store.title(&b).await?, "[b] native-b");
+    assert_eq!(store.title(&a).await?, "[work] native-a");
+    assert_eq!(store.title(&b).await?, "[work] native-b");
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_question_preserves_edits_until_explicit_submission() -> Result<()> {
+    for custom_reply in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("state.sqlite"))?;
+        let agent = Arc::new(FakeAgent::default());
+        let svc = Service::new(
+            Arc::new(fake_config()),
+            store.clone(),
+            agent.clone(),
+            vec![Arc::new(FakeIm)],
+        );
+        let session = store.ensure_session("work", "questions").await?;
+        svc.ensure_topics(&session).await?;
+        let target = store.targets(&session.id).await?.remove(0);
+        let event = AgentEvent {
+            session: session.id.clone(),
+            key: "request:question-id".into(),
+            kind: EventKind::Question,
+            text: "Choose".into(),
+            complete: true,
+            origin: None,
+            request: Some(PendingRequest {
+                id: "question-id".into(),
+                label: "Choose".into(),
+                choices: vec![],
+                kind: RequestKind::Questions,
+                blocking: true,
+                questions: vec![Question {
+                    id: "color".into(),
+                    title: "Which color?".into(),
+                    options: vec![("Blue".into(), "Cool".into())],
+                    secret: false,
+                }],
+            }),
+        };
+        store.event(&event).await?;
+        svc.project(&event, &target).await?;
+        let initial = question_card(&store, "question-id").await?;
+        let choice = card_action(&initial, "Blue");
+        assert!(choice.len() <= 64);
+        assert!(initial.text.contains("Reply to this message"));
+        store.delivery(&initial, "sent", Some("77".into())).await?;
+        if custom_reply {
+            let mut input = message("answer-1", &target, "Custom green");
+            input.reply_to = Some("77".into());
+            svc.handle(input).await?;
+        } else {
+            click_card(&svc, &initial, "answer-1", "Blue").await?;
+        }
+        assert!(agent.responses.lock().await.is_empty());
+        assert!(store.request("question-id").await.is_ok());
+        let edited = question_card(&store, "question-id").await?;
+        assert_eq!(edited.id, initial.id);
+        assert_eq!(edited.message.as_deref(), Some("77"));
+        let answer = if custom_reply {
+            click_card(&svc, &edited, "answer-2", "Blue").await?;
+            "Blue"
+        } else {
+            let mut input = message("answer-2", &target, "自定义紫色");
+            input.reply_to = Some("77".into());
+            svc.handle(input).await?;
+            "自定义紫色"
+        };
+        let edited = question_card(&store, "question-id").await?;
+        assert!(edited.text.contains(answer));
+        click_card(&svc, &edited, "submit", "Submit answers").await?;
+        assert_eq!(
+            *agent.responses.lock().await,
+            vec![serde_json::json!({"color":answer}).to_string()]
+        );
+        assert!(store.request("question-id").await.is_err());
+        assert!(agent.inputs.lock().await.is_empty());
+        let closed = question_card(&store, "question-id").await?;
+        assert_eq!(closed.id, initial.id);
+        assert!(closed.buttons.is_empty());
+        assert!(closed.text.contains("Answer submitted via Telegram"));
+        assert!(closed.text.contains(answer));
+        let before = store.pending().await?.len();
+        click_card(&svc, &edited, "duplicate-submit", "Submit answers").await?;
+        assert_eq!(agent.responses.lock().await.len(), 1);
+        assert_eq!(
+            store.pending().await?.len(),
+            before,
+            "expired callbacks must not add chat messages"
+        );
+        let mut wrong = target.clone();
+        wrong.thread = "wrong".into();
+        assert!(store.read_action(&choice, &wrong).await.is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_projection_and_restart_expire_controls() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("state.sqlite");
+    let store = Store::open(&path)?;
+    let agent = Arc::new(FakeAgent {
+        online: Mutex::new(vec![]),
+        inputs: Mutex::new(vec![]),
+        responses: Mutex::new(vec![]),
+        ..Default::default()
+    });
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        agent,
+        vec![Arc::new(FakeIm)],
+    );
+    let s = store.ensure_session("work", "projection").await?;
+    svc.ensure_topics(&s).await?;
+    let t = store.targets(&s.id).await?.remove(0);
+    let mut e = AgentEvent {
+        session: s.id,
+        key: "tool".into(),
+        kind: EventKind::Tool,
+        text: "Running tests\nverbose output".into(),
+        complete: true,
+        request: None,
+        origin: None,
+    };
+    svc.project(&e, &t).await?;
+    e.kind = EventKind::Reasoning;
+    e.text = "private reasoning".into();
+    svc.project(&e, &t).await?;
+    let pending = store.pending().await?;
+    assert!(pending.iter().any(|d| d.text == "Running tests"));
+    assert!(
+        pending
+            .iter()
+            .all(|d| !d.text.contains("verbose output") && !d.text.contains("private reasoning"))
+    );
+    for kind in [
+        EventKind::Registered,
+        EventKind::Finished,
+        EventKind::Offline,
+    ] {
+        e.kind = kind;
+        e.key = format!("lifecycle:{:?}", e.kind);
+        e.text = "Routine lifecycle status".into();
+        svc.project(&e, &t).await?;
+    }
+    assert_eq!(store.pending().await?.len(), pending.len());
+    e.kind = EventKind::Error;
+    e.key = "failed".into();
+    e.text = "Task failed: actionable error".into();
+    svc.project(&e, &t).await?;
+    assert!(store.pending().await?.iter().any(|d| d.text == e.text));
+    let token = store.action(&t, serde_json::json!({"op":"recent"})).await?;
+    let reopened = Store::open(&path)?;
+    assert!(reopened.read_action(&token, &t).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn working_indicators_do_not_create_messages() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent {
+        online: Mutex::new(vec![]),
+        inputs: Mutex::new(vec![]),
+        responses: Mutex::new(vec![]),
+        ..Default::default()
+    });
+    let im = Arc::new(TitleIm::default());
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        agent.clone(),
+        vec![im.clone()],
+    );
+    let session = store.ensure_session("work", "working").await?;
+    svc.ensure_topics(&session).await?;
+    let target = store.targets(&session.id).await?.remove(0);
+    agent.online.lock().await.push(session.id);
+    svc.indicate_working().await?;
+    assert_eq!(*im.working.lock().await, vec![target]);
+    agent.online.lock().await.clear();
+    svc.indicate_working().await?;
+    assert_eq!(im.working.lock().await.len(), 1);
+    assert!(store.pending().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_ack_does_not_lose_a_concurrent_button_update() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let t = FakeIm.spaces().remove(0);
+    store
+        .enqueue(
+            "work",
+            &t,
+            "card",
+            "Same text",
+            vec![vec![("Act".into(), "token".into())]],
+            vec![],
+        )
+        .await?;
+    let sent = store.pending().await?.remove(0);
+    assert_eq!(
+        serde_json::to_value(&sent.buttons)?,
+        serde_json::json!([[["Act", "token"]]])
+    );
+    store
+        .enqueue("work", &t, "card", "Same text", vec![], vec![])
+        .await?;
+    store.delivery(&sent, "sent", Some("42".into())).await?;
+    let updated = store.pending().await?.remove(0);
+    assert!(updated.buttons.is_empty());
+    assert_eq!(updated.message.as_deref(), Some("42"));
+    Ok(())
+}
+
+#[test]
+fn configuration_validates_projects_and_explicit_agents() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    let mut cfg = fake_config();
+    cfg.agents
+        .insert("personal".into(), cfg.agents["work"].clone());
+    let validate = |cfg: &Config| -> Result<Config> {
+        std::fs::write(&path, toml::to_string(cfg)?)?;
+        Config::load(&path)
+    };
+    assert!(
+        validate(&cfg).is_err(),
+        "each agent requires its own Bot reference"
+    );
+    cfg.agents.get_mut("personal").unwrap().telegram.token_env = "PERSONAL_TOKEN".into();
+    cfg.projects
+        .get_mut("demo")
+        .unwrap()
+        .agents
+        .push("personal".into());
+    assert_eq!(validate(&cfg)?.projects["demo"].agents.len(), 2);
+    let mut duplicate = cfg.projects["demo"].clone();
+    duplicate.cwd = dir.path().to_owned();
+    cfg.projects.insert("second".into(), duplicate);
+    assert!(validate(&cfg).is_err(), "one group belongs to one project");
+    cfg.projects.get_mut("second").unwrap().telegram.group = -1002;
+    validate(&cfg)?;
+    cfg.projects.get_mut("second").unwrap().cwd = "/tmp".into();
+    assert!(
+        validate(&cfg).is_err(),
+        "canonical directories must be unique"
+    );
+    cfg.projects.get_mut("second").unwrap().cwd = dir.path().to_owned();
+    cfg.projects.get_mut("second").unwrap().agents = vec!["missing".into()];
+    assert!(validate(&cfg).is_err());
+    cfg.projects.get_mut("second").unwrap().agents = vec![];
+    assert!(validate(&cfg).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn question_navigation_preserves_shared_drafts_and_leaves_task_input_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent::default());
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        agent.clone(),
+        vec![Arc::new(FakeIm)],
+    );
+    let session = store.ensure_session("work", "direct-replies").await?;
+    svc.ensure_topics(&session).await?;
+    let target = store.targets(&session.id).await?.remove(0);
+    let mut event = AgentEvent {
+        session: session.id.clone(),
+        key: "request:direct".into(),
+        kind: EventKind::Question,
+        text: "Question".into(),
+        complete: true,
+        origin: None,
+        request: Some(PendingRequest {
+            id: "direct".into(),
+            label: "Question".into(),
+            kind: RequestKind::AsyncQuestions,
+            choices: vec![],
+            blocking: false,
+            questions: vec![
+                Question {
+                    id: "directory".into(),
+                    title: "Which directory?".into(),
+                    options: vec![],
+                    secret: false,
+                },
+                Question {
+                    id: "note".into(),
+                    title: "Which note?".into(),
+                    options: vec![("Default".into(), String::new())],
+                    secret: false,
+                },
+            ],
+        }),
+    };
+    store.event(&event).await?;
+    svc.project(&event, &target).await?;
+    let initial = question_card(&store, "direct").await?;
+    assert!(initial.text.contains("Which directory?"));
+    assert!(!initial.text.contains("Which note?"));
+    assert!(!initial.text.contains("Custom answer"));
+    assert_eq!(initial.buttons[0].len(), 2);
+    store.delivery(&initial, "sent", Some("99".into())).await?;
+    svc.handle(message("ordinary", &target, "keep working"))
+        .await?;
+    let mut unauthorized = message("other-user", &target, "not my answer");
+    unauthorized.sender = "2".into();
+    unauthorized.reply_to = Some("99".into());
+    svc.handle(unauthorized).await?;
+    let mut reply = message("directory-answer", &target, "/tmp/project");
+    reply.reply_to = Some("99".into());
+    svc.handle(reply).await?;
+    let first = question_card(&store, "direct").await?;
+    assert!(first.text.contains("/tmp/project"));
+    assert!(
+        first.text.contains("Which directory?"),
+        "saving never silently advances the current question"
+    );
+    click_card(&svc, &first, "go-to-note", "2 ○").await?;
+    let second = question_card(&store, "direct").await?;
+    assert!(!second.text.contains("Which directory?"));
+    click_card(&svc, &second, "choose-note", "Default").await?;
+    let mut reply = message("custom-note", &target, "中文备注");
+    reply.reply_to = Some("99".into());
+    svc.handle(reply).await?;
+    let answered = question_card(&store, "direct").await?;
+    click_card(&svc, &answered, "review", "Review answers").await?;
+    let review = question_card(&store, "direct").await?;
+    assert!(review.text.contains("/tmp/project"));
+    assert!(review.text.contains("中文备注"));
+    click_card(&svc, &review, "edit-first", "1 ✓").await?;
+    let mut reply = message("directory-revised", &target, "/tmp/revised");
+    reply.reply_to = Some("99".into());
+    reply.sender = "3".into();
+    svc.handle(reply).await?;
+    let revised = question_card(&store, "direct").await?;
+    click_card(&svc, &revised, "review-revised", "Review answers").await?;
+    let reviewed = question_card(&store, "direct").await?;
+    assert!(reviewed.text.contains("/tmp/revised"));
+    assert!(
+        reviewed.text.contains("中文备注"),
+        "another authorized participant must see the same draft"
+    );
+    assert!(agent.responses.lock().await.is_empty());
+    click_card(&svc, &reviewed, "submit-replies", "Submit answers").await?;
+    assert_eq!(
+        *agent.responses.lock().await,
+        vec![r#"{"directory":"/tmp/revised","note":"中文备注"}"#]
+    );
+    assert_eq!(*agent.inputs.lock().await, vec!["keep working"]);
+    let closed = question_card(&store, "direct").await?;
+    assert_eq!(closed.id, initial.id);
+    assert_eq!(closed.message.as_deref(), Some("99"));
+    assert!(closed.buttons.is_empty());
+
+    // Native resolution edits the original card and discards its outstanding draft.
+    event.key = "request:cli-resolved".into();
+    event.request.as_mut().unwrap().id = "cli-resolved".into();
+    store.event(&event).await?;
+    svc.project(&event, &target).await?;
+    let native_card = question_card(&store, "cli-resolved").await?;
+    store
+        .delivery(&native_card, "sent", Some("100".into()))
+        .await?;
+    let mut reply = message("unfinished", &target, "local draft");
+    reply.reply_to = Some("100".into());
+    svc.handle(reply).await?;
+    store.resolve("cli-resolved").await?;
+    event.request = None;
+    event.kind = EventKind::Status;
+    event.text = "Answer submitted via CLI\nWhich directory?: /cli\nWhich note?: Terminal".into();
+    svc.project(&event, &target).await?;
+    let resolved = question_card(&store, "cli-resolved").await?;
+    assert_eq!(resolved.id, native_card.id);
+    assert!(resolved.buttons.is_empty());
+    assert!(resolved.text.contains("Answer submitted via CLI"));
+    assert!(!resolved.text.contains("local draft"));
+    let mut old_reply = message("expired-question", &target, "must not steer");
+    old_reply.reply_to = Some("100".into());
+    svc.handle(old_reply).await?;
+    assert_eq!(*agent.inputs.lock().await, vec!["keep working"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_user_messages_are_labeled_without_echoing_telegram_input() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        Arc::new(FakeAgent::default()),
+        vec![Arc::new(FakeIm)],
+    );
+    let session = store.ensure_session("work", "sources").await?;
+    svc.ensure_topics(&session).await?;
+    let target = store.targets(&session.id).await?.remove(0);
+    let mut event = AgentEvent {
+        session: session.id,
+        key: "terminal-input".into(),
+        kind: EventKind::User,
+        text: "Please inspect the project".into(),
+        complete: true,
+        request: None,
+        origin: None,
+    };
+    svc.project(&event, &target).await?;
+    let pending = store.pending().await?;
+    assert_eq!(pending[0].text, "You · CLI\n\nPlease inspect the project");
+    store
+        .claim_message("telegram-input", &serde_json::to_string(&target)?)
+        .await?;
+    event.key = "telegram-input".into();
+    event.origin = Some("telegram-input".into());
+    svc.project(&event, &target).await?;
+    assert_eq!(store.pending().await?.len(), pending.len());
+    event.kind = EventKind::Text;
+    event.key = "agent-answer".into();
+    event.text = "Project inspected".into();
+    event.origin = None;
+    svc.project(&event, &target).await?;
+    assert!(
+        store
+            .pending()
+            .await?
+            .iter()
+            .any(|d| d.text == "Project inspected")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn topic_status_identifies_native_session_and_mode_commands_preserve_active_work()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent::default());
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        agent.clone(),
+        vec![Arc::new(FakeIm)],
+    );
+    let session = store.ensure_session("work", "native-thread-123").await?;
+    svc.ensure_topics(&session).await?;
+    let target = store.targets(&session.id).await?.remove(0);
+    svc.handle(message("status", &target, "/status")).await?;
+    let status = store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key == "status:0")
+        .unwrap();
+    assert!(status.text.contains("Session: native-thread-123"));
+    assert!(status.text.contains("CWD: /tmp"));
+    assert!(status.text.contains("Project: demo"));
+    assert!(status.text.contains("Mode (next turn): Default"));
+    assert!(status.text.contains("Agent: work"));
+    assert!(!status.text.contains(&session.id));
+    let toggle = message("plan-mode", &target, "/plan");
+    svc.handle(toggle.clone()).await?;
+    svc.handle(toggle).await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Plan);
+    assert!(agent.inputs.lock().await.is_empty());
+    svc.handle(message("plan-off", &target, "/plan")).await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    svc.handle(message("plan-on", &target, "/plan")).await?;
+    svc.handle(message("plan-task", &target, "/plan inspect this project"))
+        .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Plan);
+    assert_eq!(*agent.inputs.lock().await, vec!["inspect this project"]);
+    svc.handle(message(
+        "default-task",
+        &target,
+        "/default implement the changes",
+    ))
+    .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    assert_eq!(
+        *agent.inputs.lock().await,
+        vec!["inspect this project", "implement the changes"]
+    );
+    agent.online.lock().await.push(session.id.clone());
+    svc.handle(message(
+        "busy-plan-task",
+        &target,
+        "/plan do not steer this",
+    ))
+    .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    assert_eq!(agent.inputs.lock().await.len(), 2);
+    svc.handle(message("busy-plan-mode", &target, "/plan"))
+        .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Plan);
+    assert_eq!(agent.inputs.lock().await.len(), 2);
+    assert!(agent.online.lock().await.contains(&session.id));
+    svc.handle(message("busy-plan-off", &target, "/plan"))
+        .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    agent.set_mode(&session, SessionMode::Plan).await?;
+    svc.handle(message("after-cli-mode-change", &target, "/plan"))
+        .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    assert_eq!(agent.inputs.lock().await.len(), 2);
+    assert!(agent.online.lock().await.contains(&session.id));
+    svc.handle(message("default-mode", &target, "/default"))
+        .await?;
+    assert_eq!(agent.modes.lock().await[&session.id], SessionMode::Default);
+    Ok(())
+}
+
+#[tokio::test]
+async fn long_question_cards_stay_single_and_uncertain_answers_cannot_be_resubmitted() -> Result<()>
+{
+    for answer in ["中文🧩".repeat(2000), "uncertain-answer".into()] {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("state.sqlite"))?;
+        let agent = Arc::new(FakeAgent::default());
+        let svc = Service::new(
+            Arc::new(fake_config()),
+            store.clone(),
+            agent.clone(),
+            vec![Arc::new(FakeIm)],
+        );
+        let session = store.ensure_session("work", "long-answer").await?;
+        svc.ensure_topics(&session).await?;
+        let target = store.targets(&session.id).await?.remove(0);
+        let event = AgentEvent {
+            session: session.id.clone(),
+            key: "request:long".into(),
+            kind: EventKind::Question,
+            text: "Question".into(),
+            complete: true,
+            origin: None,
+            request: Some(PendingRequest {
+                id: "long".into(),
+                label: "Question".into(),
+                choices: vec![],
+                kind: RequestKind::Questions,
+                blocking: true,
+                questions: vec![Question {
+                    id: "note".into(),
+                    title: "Long title 🧩".repeat(500),
+                    options: vec![],
+                    secret: false,
+                }],
+            }),
+        };
+        store.event(&event).await?;
+        svc.project(&event, &target).await?;
+        let initial = question_card(&store, "long").await?;
+        store.delivery(&initial, "sent", Some("101".into())).await?;
+        let mut input = message("answer", &target, &answer);
+        input.reply_to = Some("101".into());
+        svc.handle(input).await?;
+        let ready = question_card(&store, "long").await?;
+        assert_eq!(ready.id, initial.id);
+        assert!(ready.text.encode_utf16().count() <= 3500);
+        assert_eq!(store.pending().await?.len(), 1);
+        click_card(&svc, &ready, "submit", "Submit answers").await?;
+        assert_eq!(
+            *agent.responses.lock().await,
+            vec![serde_json::json!({"note":answer}).to_string()]
+        );
+        let closed = question_card(&store, "long").await?;
+        assert!(closed.buttons.is_empty());
+        assert_eq!(closed.id, initial.id);
+        if answer == "uncertain-answer" {
+            assert!(store.request("long").await.is_ok());
+            click_card(&svc, &ready, "retry", "Submit answers").await?;
+            assert_eq!(agent.responses.lock().await.len(), 1);
+            assert_eq!(store.pending().await?.len(), 1);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_requires_a_directory_and_agents_only_links_bound_sessions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let mut cfg = fake_config();
+    cfg.projects.get_mut("demo").unwrap().cwd = dir.path().to_owned();
+    let svc = Service::new(
+        Arc::new(cfg),
+        store.clone(),
+        agent.clone(),
+        vec![Arc::new(FakeIm)],
+    );
+    let group = FakeIm.spaces().remove(0);
+    for (id, input) in [
+        ("empty", "/new"),
+        ("relative", "/new relative/path"),
+        ("missing", "/new /uaoi-test-nonexistent-dir"),
+    ] {
+        svc.handle(message(id, &group, input)).await?;
+    }
+    assert!(agent.management.lock().await.is_empty());
+    let mut create = message(
+        "new",
+        &group,
+        &format!("/new@WorkBot {}", dir.path().display()),
+    );
+    create.addressed = true;
+    svc.handle(create).await?;
+    let bound = store.bindings().await?.1.remove(0);
+    let cwd = dir.path().join("not-present-anymore");
+    let hidden = store.ensure_session("work", "unbound-history").await?;
+    *agent.listed.lock().await = vec![
+        SessionSummary {
+            native: bound.session.native.clone(),
+            title: "中文 🧩 Session".into(),
+            cwd: cwd.clone(),
+            status: "notLoaded".into(),
+        },
+        SessionSummary {
+            native: hidden.native,
+            title: "Unbound history".into(),
+            cwd,
+            status: "idle".into(),
+        },
+    ];
+    svc.handle(message("list", &group, "/agents")).await?;
+    let card = store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key == "list:0")
+        .unwrap();
+    assert!(card.text.contains("中文 🧩 Session"));
+    assert!(card.text.contains("Sleeping"));
+    assert!(!card.text.contains("Unbound history"));
+    assert!(
+        !card.text.contains("/resume")
+            && !card.text.contains("https://")
+            && !card.text.contains("Session:")
+    );
+    assert_eq!(
+        &card.text[card.links[0].start..card.links[0].end],
+        "中文 🧩 Session"
+    );
+    assert_eq!(card.links[0].url, FakeIm.link(&bound.target));
+    let calls = agent.management.lock().await.len();
+    for (i, command) in [
+        "/list",
+        "/resume anything",
+        "/steer hello",
+        "/output verbose",
+    ]
+    .iter()
+    .enumerate()
+    {
+        svc.handle(message(&format!("removed-{i}"), &bound.target, command))
+            .await?;
+    }
+    assert_eq!(agent.management.lock().await.len(), calls);
+    assert!(agent.inputs.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn binding_edits_are_versioned_and_unbinding_stops_projection() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        agent,
+        vec![Arc::new(FakeIm)],
+    );
+    let first = store.ensure_session("work", "first").await?;
+    svc.ensure_topics(&first).await?;
+    let old = store.bindings().await?.1.remove(0);
+    let mut document: BindingsDocument =
+        serde_json::from_value(svc.bindings_snapshot().await?["document"].clone())?;
+    let stale = document.clone();
+    svc.notice(
+        &old.target,
+        "pending",
+        "must not be delivered after unbinding",
+    )
+    .await?;
+    let queued = store.pending().await?.remove(0);
+    let action = store
+        .action(&old.target, serde_json::json!({"op":"submit"}))
+        .await?;
+    document.bindings = vec![BindingSpec {
+        project: "demo".into(),
+        agent: "work".into(),
+        session: "second".into(),
+        topic: None,
+    }];
+    svc.apply_bindings(document).await?;
+    assert!(store.targets(&first.id).await?.is_empty());
+    assert!(!store.delivery_current(&queued).await?);
+    assert!(store.read_action(&action, &old.target).await.is_err());
+    let next = store.bindings().await?.1.remove(0);
+    assert_eq!(next.session.native, "second");
+    assert_ne!(next.target, old.target);
+    assert!(svc.apply_bindings(stale).await.is_err());
+    let event = AgentEvent {
+        session: first.id,
+        key: "late-event".into(),
+        kind: EventKind::Text,
+        text: "ignored".into(),
+        complete: true,
+        request: None,
+        origin: None,
+    };
+    svc.project(&event, &old.target).await?;
+    assert!(store.pending().await?.is_empty());
+    let mut document: BindingsDocument =
+        serde_json::from_value(svc.bindings_snapshot().await?["document"].clone())?;
+    document.bindings.push(document.bindings[0].clone());
+    assert!(svc.apply_bindings(document).await.is_err());
+    assert_eq!(store.bindings().await?.1.len(), 1);
+    let mut duplicate: BindingsDocument =
+        serde_json::from_value(svc.bindings_snapshot().await?["document"].clone())?;
+    duplicate.bindings[0].topic = None;
+    duplicate.bindings.push(BindingSpec {
+        project: "demo".into(),
+        agent: "work".into(),
+        session: "third".into(),
+        topic: Some(next.target.thread.clone()),
+    });
+    assert!(svc.apply_bindings(duplicate).await.is_err());
+    assert_eq!(store.bindings().await?.1.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_binding_documents_never_allocate_topics() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let im = Arc::new(TitleIm::default());
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        Arc::new(FakeAgent {
+            store: Some(store.clone()),
+            unavailable: vec!["missing-native-id".into()],
+            ..Default::default()
+        }),
+        vec![im.clone()],
+    );
+    let document = BindingsDocument {
+        version: 2,
+        revision: 0,
+        bindings: ["valid-native-id", "missing-native-id"]
+            .into_iter()
+            .map(|session| BindingSpec {
+                project: "demo".into(),
+                agent: "work".into(),
+                session: session.into(),
+                topic: None,
+            })
+            .collect(),
+    };
+    assert!(svc.apply_bindings(document).await.is_err());
+    assert!(im.created.lock().await.is_empty());
+    let (revision, bindings) = store.bindings().await?;
+    assert_eq!(revision, 0);
+    assert!(bindings.is_empty());
     Ok(())
 }

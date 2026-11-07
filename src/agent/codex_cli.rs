@@ -21,7 +21,21 @@ pub fn invocation(args: &[OsString], base: &Path) -> Result<(bool, PathBuf)> {
             return Ok((false, cwd));
         }
         if !positional
-            && (a == "--remote" || a.starts_with("--remote=") || a == "--remote-auth-token-env")
+            && (a == "-p"
+                || a == "--profile"
+                || a.starts_with("--profile=")
+                || a.starts_with("-p") && a.len() > 2)
+        {
+            anyhow::bail!(
+                "Configure the profile on the agent launcher, then select it with uaoi --agent NAME"
+            );
+        }
+        if !positional
+            && (a == "--remote"
+                || a.starts_with("--remote=")
+                || a == "--remote-auth-token-env"
+                || a.starts_with("--remote-auth-token-env=")
+                || a == "--no-daemon")
         {
             anyhow::bail!("uaoi owns the remote endpoint; omit --remote");
         }
@@ -61,7 +75,6 @@ pub fn invocation(args: &[OsString], base: &Path) -> Result<(bool, PathBuf)> {
         i += 1;
     }
     let native_commands = [
-        "agents",
         "exec",
         "e",
         "review",

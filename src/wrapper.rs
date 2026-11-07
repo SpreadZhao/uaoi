@@ -33,7 +33,7 @@ pub async fn request(io: &mut BufReader<UnixStream>, value: Value) -> Result<Val
     );
     Ok(v["result"].clone())
 }
-async fn connect(cfg: &Config, path: &Path) -> Result<BufReader<UnixStream>> {
+pub async fn connect(cfg: &Config, path: &Path) -> Result<BufReader<UnixStream>> {
     private_dir(&cfg.state())?;
     private_dir(&cfg.runtime())?;
     // Separate from the broker's lifetime lock: serialize discovery and startup.
@@ -59,7 +59,7 @@ async fn connect(cfg: &Config, path: &Path) -> Result<BufReader<UnixStream>> {
         let mut cmd = std::process::Command::new(std::env::current_exe()?);
         cmd.arg("--config")
             .arg(path)
-            .arg("broker")
+            .arg("serve")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log);
@@ -91,16 +91,15 @@ async fn connect(cfg: &Config, path: &Path) -> Result<BufReader<UnixStream>> {
     drop(lock);
     result
 }
-pub async fn run(cfg: &Config, path: &Path, args: Vec<OsString>) -> Result<i32> {
+pub async fn run(
+    cfg: &Config,
+    path: &Path,
+    explicit_agent: Option<&str>,
+    args: Vec<OsString>,
+) -> Result<i32> {
     let base = std::env::current_dir()?;
     let (interactive, cwd) = crate::agent::codex_cli::invocation(&args, &base)?;
-    // Informational commands can run outside a project.
-    let agent = cfg
-        .project(&cwd)
-        .ok()
-        .map(|(_, p)| p.agent.as_str())
-        .or_else(|| cfg.agents.keys().next().map(String::as_str))
-        .context("Configure an agent")?;
+    let agent = cfg.select_agent(explicit_agent)?;
     let spec = &cfg.agents[agent];
     if !interactive {
         let error = std::process::Command::new(&spec.command[0])
@@ -110,9 +109,8 @@ pub async fn run(cfg: &Config, path: &Path, args: Vec<OsString>) -> Result<i32> 
             .exec();
         return Err(error.into());
     }
-    let (project, _) = cfg.project(&cwd)?;
     let mut io = connect(cfg, path).await?;
-    let plan: LaunchPlan = serde_json::from_value(request(&mut io, json!({"method":"open","args":args,"project":project,"cwd":cwd,"config":path,"fingerprint":cfg.fingerprint(),"env":std::env::vars().collect::<std::collections::BTreeMap<_,_>>()})).await?)?;
+    let plan: LaunchPlan = serde_json::from_value(request(&mut io, json!({"method":"open","args":args,"agent":agent,"cwd":cwd,"config":path,"fingerprint":cfg.fingerprint(),"env":std::env::vars().collect::<std::collections::BTreeMap<_,_>>()})).await?)?;
     let mut cmd = Command::new(&plan.command[0]);
     cmd.args(&plan.command[1..])
         .env_clear()
@@ -141,7 +139,7 @@ pub async fn run(cfg: &Config, path: &Path, args: Vec<OsString>) -> Result<i32> 
             _=io.read_line(&mut line)=>{ anyhow::bail!("uaoi service disconnected"); }
         }
     };
-    // Keep the lease until the TUI is reaped, then wait for server cleanup.
+    // Release only this terminal gateway; the shared server keeps its tasks.
     request(&mut io, json!({"method":"close"})).await?;
     Ok(status
         .code()

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -8,14 +8,11 @@ use std::{
 #[derive(Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub version: u32,
     pub state_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
-    #[serde(default)]
     pub agents: BTreeMap<String, AgentSpec>,
-    #[serde(default)]
-    pub projects: BTreeMap<String, Project>,
-    #[serde(default)]
-    pub im: ImConfig,
+    pub projects: BTreeMap<String, ProjectSpec>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,22 +21,32 @@ pub struct AgentSpec {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    pub telegram: TelegramConfig,
+    #[serde(default)]
+    pub output: OutputMode,
 }
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Project {
-    pub workspace: PathBuf,
-    pub agent: String,
-}
-#[derive(Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct ImConfig {
-    pub telegram: Option<TelegramConfig>,
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputMode {
+    #[default]
+    Compact,
+    Verbose,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     pub token_env: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSpec {
+    pub cwd: PathBuf,
+    pub agents: Vec<String>,
+    pub telegram: ProjectTelegram,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTelegram {
     pub group: i64,
     pub allowed_users: Vec<i64>,
 }
@@ -49,44 +56,72 @@ impl Config {
             &std::fs::read_to_string(path)
                 .with_context(|| format!("Read configuration {}", path.display()))?,
         )?;
-        let mut workspaces = std::collections::HashSet::new();
-        for (name, p) in &mut cfg.projects {
-            anyhow::ensure!(
-                p.workspace.is_absolute(),
-                "Project {name}: workspace must be absolute"
-            );
-            p.workspace = std::fs::canonicalize(&p.workspace)
-                .with_context(|| format!("Project {name}: workspace must exist"))?;
-            anyhow::ensure!(
-                workspaces.insert(p.workspace.clone()),
-                "Project {name}: workspace already configured"
-            );
-            anyhow::ensure!(
-                p.workspace.is_dir(),
-                "Project {name}: workspace is not a directory"
-            );
-            anyhow::ensure!(
-                cfg.agents.contains_key(&p.agent),
-                "Unknown agent {}",
-                p.agent
-            );
-        }
-        for (name, a) in &cfg.agents {
+        anyhow::ensure!(
+            cfg.version == 3,
+            "Configuration version 3 required; create a new configuration and state directory"
+        );
+        anyhow::ensure!(
+            !cfg.agents.is_empty(),
+            "Configure at least one agent instance"
+        );
+        anyhow::ensure!(!cfg.projects.is_empty(), "Configure at least one project");
+        let mut credentials = std::collections::HashSet::new();
+        for (name, a) in &mut cfg.agents {
             anyhow::ensure!(a.kind == "codex", "Agent {name}: only codex is implemented");
             anyhow::ensure!(
                 !a.command.is_empty() && !a.command[0].is_empty(),
                 "Agent {name}: empty command"
             );
-        }
-        if let Some(t) = &cfg.im.telegram {
-            anyhow::ensure!(t.group < 0, "Telegram group must be a group chat ID");
             anyhow::ensure!(
-                !t.allowed_users.is_empty(),
-                "Telegram allowed_users must not be empty"
+                !a.telegram.token_env.is_empty()
+                    && credentials.insert(a.telegram.token_env.clone()),
+                "Agent {name}: each agent requires its own Bot credential reference"
             );
         }
-        if cfg.projects.is_empty() {
-            bail!("Configure at least one project");
+        let mut groups = std::collections::HashSet::new();
+        let mut directories = std::collections::HashSet::new();
+        for (name, project) in &mut cfg.projects {
+            anyhow::ensure!(
+                project.cwd.is_absolute(),
+                "Project {name}: cwd must be absolute"
+            );
+            project.cwd = std::fs::canonicalize(&project.cwd)
+                .with_context(|| format!("Project {name}: cwd must exist"))?;
+            anyhow::ensure!(
+                project.cwd.is_dir(),
+                "Project {name}: cwd must be a directory"
+            );
+            anyhow::ensure!(
+                directories.insert(project.cwd.clone()),
+                "Projects must have distinct canonical directories"
+            );
+            anyhow::ensure!(
+                project.telegram.group < 0,
+                "Project {name}: Telegram group must be negative"
+            );
+            anyhow::ensure!(
+                groups.insert(project.telegram.group),
+                "Each Telegram group must belong to exactly one project"
+            );
+            anyhow::ensure!(
+                !project.telegram.allowed_users.is_empty(),
+                "Project {name}: configure allowed_users"
+            );
+            let mut members = std::collections::HashSet::new();
+            anyhow::ensure!(
+                !project.agents.is_empty(),
+                "Project {name}: configure available agents"
+            );
+            for agent in &project.agents {
+                anyhow::ensure!(
+                    cfg.agents.contains_key(agent),
+                    "Project {name}: unknown agent {agent}"
+                );
+                anyhow::ensure!(
+                    members.insert(agent),
+                    "Project {name}: duplicate agent {agent}"
+                );
+            }
         }
         for path in [&cfg.state_dir, &cfg.runtime_dir].into_iter().flatten() {
             anyhow::ensure!(
@@ -96,13 +131,30 @@ impl Config {
         }
         Ok(cfg)
     }
-    pub fn project(&self, cwd: &Path) -> Result<(&str, &Project)> {
-        self.projects
+    pub fn project_for_cwd(&self, agent: &str, cwd: &Path) -> Result<(&str, &ProjectSpec)> {
+        let cwd = std::fs::canonicalize(cwd).context("Working directory must exist")?;
+        anyhow::ensure!(cwd.is_dir(), "Working directory must be a directory");
+        let (name, project) = self
+            .projects
             .iter()
-            .filter(|(_, p)| cwd.starts_with(&p.workspace))
-            .max_by_key(|(_, p)| p.workspace.components().count())
-            .map(|(name, p)| (name.as_str(), p))
-            .context("No configured project contains this directory")
+            .find(|(_, p)| p.cwd == cwd)
+            .with_context(|| {
+                format!(
+                    "No project configured for {}; add it to projects and restart uaoi",
+                    cwd.display()
+                )
+            })?;
+        anyhow::ensure!(
+            project.agents.iter().any(|a| a == agent),
+            "Agent {agent} is not available in project {name}"
+        );
+        Ok((name, project))
+    }
+    pub fn select_agent<'a>(&'a self, explicit: Option<&str>) -> Result<&'a str> {
+        self.agents
+            .get_key_value(explicit.context("Select an agent explicitly with --agent NAME")?)
+            .map(|(name, _)| name.as_str())
+            .context("Unknown agent instance")
     }
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
