@@ -87,11 +87,17 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
                 } else {
                     json!({"type":"message","role":"assistant","phase":"final_answer","id":format!("msg_{id}"),"content":[{"type":"output_text","text":plan_text}]})
                 };
-                let events = [
+                let mut events = vec![
                     json!({"type":"response.created","response":{"id":id}}),
                     json!({"type":"response.output_item.done","item":item}),
                     json!({"type":"response.completed","response":{"id":id,"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}),
                 ];
+                if prompt.contains("MINIMAL OUTPUT") {
+                    events.insert(1, json!({"type":"response.output_item.done","output_index":0,
+                        "item":{"type":"message","role":"assistant","phase":"commentary","id":format!("progress_{id}"),
+                        "content":[{"type":"output_text","text":"INTERMEDIATE WORK MESSAGE"}]}}));
+                    events[2]["output_index"] = json!(1);
+                }
                 let body = events
                     .iter()
                     .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
@@ -348,8 +354,10 @@ trust_level = "trusted"
     // Resume alone does not bind history. A new message binds the same native
     // session, and subsequent Telegram input retains its original context.
     let im = Arc::new(TitleIm::default());
+    let mut projection_cfg = cfg.clone();
+    projection_cfg.agents.get_mut("work").unwrap().output = OutputMode::Minimal;
     let svc = Arc::new(Service::new(
-        Arc::new(cfg.clone()),
+        Arc::new(projection_cfg),
         store.clone(),
         backend.clone(),
         vec![im.clone()],
@@ -394,21 +402,23 @@ trust_level = "trusted"
     ))
     .await?;
     wait_finished(&mut received, &legacy).await?;
+    svc.handle(message(
+        "legacy-minimal",
+        &target,
+        "CONTINUE LEGACY MINIMAL OUTPUT",
+    ))
+    .await?;
+    wait_finished(&mut received, &legacy).await?;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let pending = store.pending().await?;
-            if pending
-                .iter()
-                .filter(|d| d.target == target && d.text == "LEGACY_CONTEXT_OK")
-                .count()
-                == 2
-            {
+            if pending.iter().filter(|d| d.target == target && d.text == "LEGACY_CONTEXT_OK").count() == 3 {
+                assert!(!pending.iter().any(|d| d.target == target && d.text.contains("INTERMEDIATE WORK MESSAGE")));
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    })
-    .await??;
+    }).await??;
     backend.history(&legacy).await?;
     let history = store.history(&legacy.id, 100, 0).await?;
     assert!(history.iter().any(|e| e.text == "LEGACY CONTEXT MARKER"));
@@ -417,7 +427,7 @@ trust_level = "trusted"
             .iter()
             .filter(|e| e.text == "LEGACY_CONTEXT_OK")
             .count(),
-        2
+        3
     );
     assert_eq!(im.created.lock().await.len(), 1);
     let mut document: BindingsDocument =

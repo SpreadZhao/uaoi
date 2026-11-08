@@ -9,7 +9,7 @@ version = 4
 [agents.work]
 kind = "codex"
 command = ["/absolute/path/to/codex-work"]
-output = "compact" # compact or verbose; configuration only
+output = "compact" # full, compact, or minimal; work messages only
 # env = { CODEX_HOME = "/home/you/.codex-work" }
 [agents.work.telegram]
 token = "YOUR_WORK_BOT_TOKEN"

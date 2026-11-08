@@ -6,7 +6,7 @@ pub struct Session {
     pub agent: String,
     pub native: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Conversation {
     pub platform: String,
     pub space: String,

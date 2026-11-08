@@ -28,9 +28,10 @@ pub struct AgentSpec {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputMode {
+    Full,
     #[default]
     Compact,
-    Verbose,
+    Minimal,
 }
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

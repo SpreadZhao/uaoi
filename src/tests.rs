@@ -896,6 +896,357 @@ async fn compact_projection_and_restart_expire_controls() -> Result<()> {
 }
 
 #[tokio::test]
+async fn output_modes_filter_work_but_keep_interactions() -> Result<()> {
+    for mode in [OutputMode::Full, OutputMode::Compact, OutputMode::Minimal] {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("state.sqlite"))?;
+        let mut cfg = fake_config();
+        cfg.agents.get_mut("work").unwrap().output = mode;
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, toml::to_string(&cfg)?)?;
+        let cfg = Config::load(&path)?;
+        assert_eq!(cfg.agents["work"].output, mode);
+        let agent = Arc::new(FakeAgent::default());
+        let svc = Service::new(
+            Arc::new(cfg),
+            store.clone(),
+            agent.clone(),
+            vec![Arc::new(FakeIm)],
+        );
+        let session = store.ensure_session("work", "output-modes").await?;
+        svc.ensure_topics(&session).await?;
+        let target = store.targets(&session.id).await?.remove(0);
+        let event = |kind, key: &str, text: &str| AgentEvent {
+            session: session.id.clone(),
+            kind,
+            key: key.into(),
+            text: text.into(),
+            complete: true,
+            request: None,
+            origin: None,
+        };
+        svc.project(&event(EventKind::User, "user", "My task"), &target)
+            .await?;
+        for (kind, key, text) in [
+            (EventKind::Text, "progress", "Working on the task"),
+            (
+                EventKind::Reasoning,
+                "reasoning",
+                "Available reasoning summary",
+            ),
+            (EventKind::Tool, "tool-one", "Tool one\nDetailed output one"),
+            (EventKind::Tool, "tool-two", "Tool two\nDetailed output two"),
+            (EventKind::Plan, "work-plan", "Intermediate work plan"),
+        ] {
+            svc.project(&event(kind, key, text), &target).await?;
+        }
+        let mut question = event(EventKind::Question, "request:question", "Choose");
+        question.request = Some(PendingRequest {
+            id: "question".into(),
+            label: "Choose".into(),
+            choices: vec![],
+            kind: RequestKind::Questions,
+            blocking: true,
+            questions: vec![Question {
+                id: "color".into(),
+                title: "Which color?".into(),
+                options: vec![("Blue".into(), "Cool".into())],
+                secret: false,
+            }],
+        });
+        store.event(&question).await?;
+        svc.project(&question, &target).await?;
+        let card = question_card(&store, "question").await?;
+        assert!(!card.buttons.is_empty());
+        click_card(&svc, &card, "choose", "Blue").await?;
+        let card = question_card(&store, "question").await?;
+        click_card(&svc, &card, "submit", "Submit answers").await?;
+        assert_eq!(*agent.responses.lock().await, [r#"{"color":"Blue"}"#]);
+        let card = question_card(&store, "question").await?;
+        assert!(card.buttons.is_empty() && card.text.contains("Answer submitted"));
+        svc.project(&event(EventKind::Text, "answer", "Partial answer"), &target)
+            .await?;
+        svc.project(&event(EventKind::Text, "answer", "Final answer"), &target)
+            .await?;
+        let pending = store.pending().await?;
+        assert!(pending.iter().any(|d| d.text == "You · CLI\n\nMy task"));
+        assert_eq!(
+            pending.iter().any(|d| d.text == "Final answer"),
+            mode != OutputMode::Minimal
+        );
+        assert_eq!(
+            pending.iter().any(|d| d.text == "Working on the task"),
+            mode != OutputMode::Minimal
+        );
+        assert_eq!(
+            pending.iter().any(|d| d.text.contains("Detailed output")),
+            mode == OutputMode::Full
+        );
+        assert_eq!(
+            pending
+                .iter()
+                .any(|d| d.text.contains("Available reasoning")),
+            mode == OutputMode::Full
+        );
+        if mode == OutputMode::Compact {
+            assert!(pending.iter().any(|d| d.text == "Tool two"));
+            assert!(!pending.iter().any(|d| d.text == "Tool one"));
+        }
+        svc.project(
+            &event(EventKind::Finished, "finished", "Turn completed"),
+            &target,
+        )
+        .await?;
+        let pending = store.pending().await?;
+        assert_eq!(
+            pending.iter().filter(|d| d.text == "Final answer").count(),
+            1
+        );
+        assert!(!pending.iter().any(|d| d.text == "Partial answer"));
+        if mode == OutputMode::Minimal {
+            assert_eq!(
+                pending.len(),
+                3,
+                "user input, interaction card, final answer only"
+            );
+        }
+        // A failed task must not publish the buffered progress as its answer.
+        svc.project(
+            &event(EventKind::Text, "failed-progress", "Unfinished progress"),
+            &target,
+        )
+        .await?;
+        svc.project(&event(EventKind::Error, "error", "Task failed"), &target)
+            .await?;
+        svc.project(
+            &event(EventKind::Finished, "after-error", "Turn ended"),
+            &target,
+        )
+        .await?;
+        let pending = store.pending().await?;
+        assert!(pending.iter().any(|d| d.text == "Task failed"));
+        if mode == OutputMode::Minimal {
+            assert!(!pending.iter().any(|d| d.text == "Unfinished progress"));
+        }
+        // Final plan content and its decision controls both remain usable.
+        svc.project(&event(EventKind::Plan, "proposal", "Final plan"), &target)
+            .await?;
+        let mut proposal = event(
+            EventKind::Question,
+            "request:proposal",
+            "Implement this plan?",
+        );
+        proposal.request = Some(PendingRequest {
+            id: "proposal".into(),
+            label: "Implement this plan?".into(),
+            kind: RequestKind::Plan,
+            blocking: false,
+            questions: vec![],
+            choices: vec![("Execute plan".into(), "execute".into())],
+        });
+        store.event(&proposal).await?;
+        svc.project(&proposal, &target).await?;
+        svc.project(
+            &event(EventKind::Finished, "plan-finished", "Turn completed"),
+            &target,
+        )
+        .await?;
+        let pending = store.pending().await?;
+        assert!(pending.iter().any(|d| d.text == "Final plan"));
+        let decision = pending
+            .iter()
+            .find(|d| d.text == "Implement this plan?")
+            .unwrap();
+        assert_eq!(decision.buttons[0][0].0, "Execute plan");
+        svc.project(
+            &event(EventKind::Text, "before-async", "Not a final answer"),
+            &target,
+        )
+        .await?;
+        let mut last_question = question.clone();
+        last_question.key = "request:last-question".into();
+        last_question.request.as_mut().unwrap().id = "last-question".into();
+        last_question.request.as_mut().unwrap().kind = RequestKind::AsyncQuestions;
+        store.event(&last_question).await?;
+        svc.project(&last_question, &target).await?;
+        svc.project(
+            &event(EventKind::Finished, "async-finished", "Turn completed"),
+            &target,
+        )
+        .await?;
+        assert!(
+            !question_card(&store, "last-question")
+                .await?
+                .buttons
+                .is_empty()
+        );
+        if mode == OutputMode::Minimal {
+            assert!(
+                !store
+                    .pending()
+                    .await?
+                    .iter()
+                    .any(|d| d.text == "Not a final answer")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_tools_group_between_visible_messages() -> Result<()> {
+    async fn cards(store: &Store, session: &Session) -> Result<Vec<Delivery>> {
+        let prefix = format!("{}:activity:", session.id);
+        Ok(store
+            .pending()
+            .await?
+            .into_iter()
+            .filter(|d| d.key.starts_with(&prefix))
+            .collect())
+    }
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let svc = Service::new(
+        Arc::new(fake_config()),
+        store.clone(),
+        Arc::new(FakeAgent::default()),
+        vec![Arc::new(FakeIm)],
+    );
+    let session = store.ensure_session("work", "grouped-tools").await?;
+    svc.ensure_topics(&session).await?;
+    let target = store.targets(&session.id).await?.remove(0);
+    let event = |kind, key: &str, text: &str| AgentEvent {
+        session: session.id.clone(),
+        kind,
+        key: key.into(),
+        text: text.into(),
+        complete: false,
+        request: None,
+        origin: None,
+    };
+    svc.project(
+        &event(EventKind::Text, "message-1", "I will inspect the project."),
+        &target,
+    )
+    .await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-a", "Reading files\nFull tool detail"),
+        &target,
+    )
+    .await?;
+    let first = cards(&store, &session).await?.remove(0);
+    store.delivery(&first, "sent", Some("11".into())).await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-b", "Searching the project"),
+        &target,
+    )
+    .await?;
+    svc.project(
+        &event(EventKind::Reasoning, "reasoning", "Hidden reasoning"),
+        &target,
+    )
+    .await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-c", "Checking the configuration"),
+        &target,
+    )
+    .await?;
+    let group = cards(&store, &session).await?;
+    assert_eq!(group.len(), 1);
+    assert_eq!(group[0].id, first.id);
+    assert_eq!(group[0].message.as_deref(), Some("11"));
+    assert_eq!(group[0].text, "Checking the configuration");
+
+    svc.project(
+        &event(
+            EventKind::Text,
+            "message-2",
+            "The configuration needs a change.",
+        ),
+        &target,
+    )
+    .await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-d", "Editing the configuration"),
+        &target,
+    )
+    .await?;
+    let second = cards(&store, &session)
+        .await?
+        .into_iter()
+        .find(|d| d.id != first.id)
+        .unwrap();
+    store.delivery(&second, "sent", Some("12".into())).await?;
+    // More text from the same streamed message does not split this group.
+    svc.project(
+        &event(
+            EventKind::Text,
+            "message-2",
+            "The configuration needs a change. I found the cause.",
+        ),
+        &target,
+    )
+    .await?;
+    svc.project(&event(EventKind::Tool, "tool-e", "Running checks"), &target)
+        .await?;
+    let group = cards(&store, &session).await?;
+    assert_eq!(group.len(), 2);
+    let updated = group.iter().find(|d| d.id == second.id).unwrap();
+    assert_eq!(updated.message.as_deref(), Some("12"));
+    assert_eq!(updated.text, "Running checks");
+    // A late result updates its original group without moving new tools there.
+    svc.project(
+        &event(EventKind::Tool, "tool-a", "File read completed"),
+        &target,
+    )
+    .await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-f", "Checks completed"),
+        &target,
+    )
+    .await?;
+    let group = cards(&store, &session).await?;
+    assert_eq!(group.len(), 2);
+    assert_eq!(
+        group.iter().find(|d| d.id == first.id).unwrap().text,
+        "File read completed"
+    );
+    assert_eq!(
+        group.iter().find(|d| d.id == second.id).unwrap().text,
+        "Checks completed"
+    );
+
+    store
+        .claim_message("telegram-input", &serde_json::to_string(&target)?)
+        .await?;
+    let mut input = event(EventKind::User, "user-message", "Continue");
+    input.origin = Some("telegram-input".into());
+    svc.project(&input, &target).await?;
+    svc.project(
+        &event(EventKind::Tool, "tool-g", "Starting the next task"),
+        &target,
+    )
+    .await?;
+    assert_eq!(cards(&store, &session).await?.len(), 3);
+    assert!(
+        store
+            .pending()
+            .await?
+            .iter()
+            .all(|d| d.text != "You · CLI\n\nContinue")
+    );
+    svc.project(
+        &event(EventKind::Finished, "turn-done", "Completed"),
+        &target,
+    )
+    .await?;
+    svc.project(&event(EventKind::Tool, "tool-h", "A fresh turn"), &target)
+        .await?;
+    assert_eq!(cards(&store, &session).await?.len(), 4);
+    Ok(())
+}
+
+#[tokio::test]
 async fn working_indicators_do_not_create_messages() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(&dir.path().join("state.sqlite"))?;

@@ -1,9 +1,9 @@
 mod interaction;
 mod output;
 use interaction::QuestionDraft;
-use output::Message;
 #[cfg(test)]
 pub(crate) use output::split_output;
+use output::{Message, OutputState};
 
 use crate::{
     agent::AgentAdapter,
@@ -54,6 +54,7 @@ pub struct Service {
     routes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     started: u64,
     drafts: Mutex<HashMap<String, QuestionDraft>>,
+    outputs: Mutex<HashMap<(String, Conversation), OutputState>>,
     binding_gate: Mutex<()>,
 }
 impl Service {
@@ -70,6 +71,7 @@ impl Service {
             ims,
             routes: Mutex::new(HashMap::new()),
             drafts: Mutex::new(HashMap::new()),
+            outputs: Mutex::new(HashMap::new()),
             binding_gate: Mutex::new(()),
             started: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -97,6 +99,10 @@ impl Service {
             drafts.remove(&id);
         }
         drop(drafts);
+        self.outputs
+            .lock()
+            .await
+            .retain(|_, state| state.agent != name);
         Ok(())
     }
     async fn route_lock(&self, t: &Conversation) -> Arc<Mutex<()>> {

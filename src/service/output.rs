@@ -2,6 +2,7 @@ use super::{Service, shorten};
 use crate::{config::OutputMode, model::*};
 use anyhow::{Context, Result};
 use serde_json::json;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub(super) struct Message<'a> {
@@ -10,6 +11,38 @@ pub(super) struct Message<'a> {
     pub(super) links: Vec<TextLink>,
 }
 
+#[derive(Default)]
+pub(super) struct OutputState {
+    pub(super) agent: String,
+    tools: ToolOutput,
+    final_message: Option<AgentEvent>,
+}
+#[derive(Default)]
+struct ToolOutput {
+    current: Option<String>,
+    tools: HashMap<String, String>,
+    messages: HashSet<String>,
+}
+impl ToolOutput {
+    fn message(&mut self, key: &str) {
+        // Streaming updates to the same message do not start another group.
+        if self.messages.insert(key.to_owned()) {
+            self.current = None;
+        }
+    }
+    fn tool(&mut self, event: &AgentEvent) -> String {
+        // A late completion still belongs to the group where that tool began.
+        if let Some(key) = self.tools.get(&event.key) {
+            return key.clone();
+        }
+        let key = self
+            .current
+            .get_or_insert_with(|| format!("{}:activity:{}", event.session, uuid::Uuid::new_v4()))
+            .clone();
+        self.tools.insert(event.key.clone(), key.clone());
+        key
+    }
+}
 impl Service {
     pub async fn notice(&self, target: &Conversation, key: &str, text: &str) -> Result<()> {
         self.output(
@@ -83,14 +116,60 @@ impl Service {
     pub(crate) async fn project(&self, e: &AgentEvent, t: &Conversation) -> Result<()> {
         let lock = self.route_lock(t).await;
         let _guard = lock.lock().await;
-        if self
-            .store
-            .bound(t)
-            .await?
-            .is_none_or(|session| session.id != e.session)
+        let Some(s) = self.store.bound(t).await?.filter(|s| s.id == e.session) else {
+            return Ok(());
+        };
+        let mode = self.cfg.agents[&s.agent].output;
+        let output_key = (e.session.clone(), t.clone());
+        if matches!(e.kind, EventKind::Finished | EventKind::Offline) {
+            let final_message = self
+                .outputs
+                .lock()
+                .await
+                .remove(&output_key)
+                .and_then(|state| state.final_message);
+            if mode == OutputMode::Minimal
+                && matches!(e.kind, EventKind::Finished)
+                && let Some(last) = final_message
+            {
+                self.output(
+                    t,
+                    &format!("{}:{}", last.session, last.key),
+                    Message {
+                        text: &last.text,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+        if matches!(e.kind, EventKind::Registered) {
+            return Ok(());
+        }
+        if mode == OutputMode::Compact
+            && matches!(e.kind, EventKind::Reasoning)
+            && e.request.is_none()
         {
             return Ok(());
         }
+        let activity_key = if mode == OutputMode::Compact {
+            let mut states = self.outputs.lock().await;
+            let state = states
+                .entry(output_key.clone())
+                .or_insert_with(|| OutputState {
+                    agent: s.agent.clone(),
+                    ..Default::default()
+                });
+            if matches!(e.kind, EventKind::Tool) && e.request.is_none() {
+                Some(state.tools.tool(e))
+            } else {
+                state.tools.message(&e.key);
+                None
+            }
+        } else {
+            None
+        };
         if e.request.is_none()
             && let Some(id) = e.key.strip_prefix("request:")
         {
@@ -103,21 +182,24 @@ impl Service {
                 )
                 .await;
         }
-        if matches!(
-            e.kind,
-            EventKind::Registered | EventKind::Finished | EventKind::Offline
-        ) {
-            return Ok(());
+        if matches!(e.kind, EventKind::User) {
+            if let Some(state) = self.outputs.lock().await.get_mut(&output_key) {
+                state.final_message = None;
+            }
+            if let Some(origin) = &e.origin
+                && self.store.origin(origin).await?.as_ref() == Some(t)
+            {
+                return Ok(());
+            }
         }
-
-        if matches!(e.kind, EventKind::User)
-            && let Some(origin) = &e.origin
-            && self.store.origin(origin).await?.as_ref() == Some(t)
-        {
-            return Ok(());
-        }
-        let s = self.store.session(&e.session).await?;
         if let Some(req) = &e.request {
+            if mode == OutputMode::Minimal && req.kind != RequestKind::Plan {
+                // A question can be the last assistant output of an async
+                // turn. Do not publish the earlier progress as its final reply.
+                if let Some(state) = self.outputs.lock().await.get_mut(&output_key) {
+                    state.final_message = None;
+                }
+            }
             if matches!(
                 req.kind,
                 RequestKind::Questions | RequestKind::AsyncQuestions
@@ -147,18 +229,39 @@ impl Service {
                 )
                 .await;
         }
-        let mode = self.cfg.agents[&s.agent].output;
-        if mode == OutputMode::Compact && matches!(e.kind, EventKind::Reasoning) {
-            return Ok(());
+        if mode == OutputMode::Minimal {
+            match e.kind {
+                EventKind::Text | EventKind::Plan => {
+                    self.outputs
+                        .lock()
+                        .await
+                        .entry(output_key.clone())
+                        .or_insert_with(|| OutputState {
+                            agent: s.agent.clone(),
+                            ..Default::default()
+                        })
+                        .final_message = Some(e.clone());
+                    return Ok(());
+                }
+                EventKind::Error => {
+                    if let Some(state) = self.outputs.lock().await.get_mut(&output_key) {
+                        state.final_message = None;
+                    }
+                }
+                // Status events report interactions, such as an answer from
+                // the CLI. Plans can be the final reply before a plan decision.
+                EventKind::User | EventKind::Status => {}
+                _ => return Ok(()),
+            }
         }
         let (key, text) = if matches!(e.kind, EventKind::User) {
             (
                 format!("{}:{}", e.session, e.key),
                 format!("You · CLI\n\n{}", e.text),
             )
-        } else if mode == OutputMode::Compact && matches!(e.kind, EventKind::Tool) {
+        } else if let Some(activity_key) = activity_key {
             (
-                format!("{}:activity", s.id),
+                activity_key,
                 e.text
                     .lines()
                     .next()
