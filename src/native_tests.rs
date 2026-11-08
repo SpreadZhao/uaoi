@@ -64,7 +64,17 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
                         .skip(last + 1)
                         .any(|v| v["type"] == "function_call_output");
                 let prompt = input.get(last).map(Value::to_string).unwrap_or_default();
-                if prompt.contains("HOLD FOR STEER") {
+                let ask_async = prompt.contains("ASK ASYNC")
+                    && !input
+                        .iter()
+                        .skip(last + 1)
+                        .any(|v| v["type"] == "function_call_output");
+                if prompt.contains("HOLD FOR STEER")
+                    || input
+                        .iter()
+                        .skip(last)
+                        .any(|item| item.to_string().contains("CUSTOMANSWER42"))
+                {
                     tokio::time::sleep(std::time::Duration::from_secs(4)).await;
                 }
                 let plan_text = if prompt.contains("PLAN PROPOSAL") {
@@ -82,7 +92,9 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
                     "MOCK ANSWER"
                 };
                 let id = uuid::Uuid::new_v4().to_string();
-                let item = if ask {
+                let item = if ask_async {
+                    json!({"type":"function_call","call_id":format!("async_{id}"),"name":"request_user_input_async","arguments":json!({"questions":[{"title":"Which color?","options":["Blue","Green"]},{"title":"Which color?","options":["Blue","Green"]}]}).to_string()})
+                } else if ask {
                     json!({"type":"function_call","call_id":format!("ask_{id}"),"name":"request_user_input","arguments":json!({"questions":[{"id":"choice","header":"Choice","question":"Choose a shared client","options":[{"label":"Terminal","description":"Answer locally"},{"label":"IM","description":"Answer remotely"}]}]}).to_string()})
                 } else {
                     json!({"type":"message","role":"assistant","phase":"final_answer","id":format!("msg_{id}"),"content":[{"type":"output_text","text":plan_text}]})
@@ -123,7 +135,7 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
             "priority":0,
             "support_verbosity":false,
             "truncation_policy":{"mode":"tokens","limit":10000},
-            "experimental_supported_tools":[]
+            "experimental_supported_tools":["request_user_input_async"]
         }]})
         .to_string(),
     )?;
@@ -631,6 +643,7 @@ trust_level = "trusted"
         .open("real-tui", "work", &cwd, &std::env::vars().collect(), &[])
         .await?;
     run_terminal(&terminal, &session.native).await?;
+    run_terminal_async_answers(&backend, &terminal, &store, &mut received).await?;
     backend.close("real-tui").await;
     assert!(backend.active(&session).await);
     backend
@@ -863,5 +876,165 @@ finally:
     .status()
     .await?;
     anyhow::ensure!(status.success(), "Native TUI integration failed");
+    Ok(())
+}
+
+async fn run_terminal_async_answers(
+    backend: &Codex,
+    plan: &LaunchPlan,
+    store: &Store,
+    received: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
+) -> Result<()> {
+    let session = backend.create("work", &plan.cwd).await?;
+    backend
+        .submit(&session, "ASYNC TEST SEED", "async-seed")
+        .await?;
+    wait_finished(received, &session).await?;
+    let temp = tempfile::tempdir()?;
+    let log = temp.path().join("terminal.log");
+    let mut command = plan.command.clone();
+    command.extend(["resume".into(), session.native.clone()]);
+    let observer = Rpc::open(std::path::Path::new(
+        plan.command
+            .last()
+            .unwrap()
+            .strip_prefix("unix://")
+            .unwrap(),
+    ))
+    .await?;
+    observer.initialize().await?;
+    observer
+        .request(
+            "thread/resume",
+            json!({"threadId":session.native,"excludeTurns":true}),
+        )
+        .await?;
+    let mut child = tokio::process::Command::new(
+        std::env::var("UAOI_TEST_PYTHON").unwrap_or_else(|_| "python3".into()),
+    )
+    .args(["-c", include_str!("terminal_fixture.py")])
+    .envs(&plan.env)
+    .env("TERM", "xterm-256color")
+    .env("UAOI_TERMINAL_COMMAND", serde_json::to_string(&command)?)
+    .env("UAOI_TERMINAL_LOG", &log)
+    .current_dir(&plan.cwd)
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .kill_on_drop(true)
+    .spawn()?;
+    let mut input = child.stdin.take().context("Missing terminal input")?;
+    let result = async {
+        wait_terminal_text(&log, 0, "mock-model").await?;
+        for (prompt, active) in [("ASK ASYNC", false), ("ASK ASYNC HOLD FOR STEER", true)] {
+            let before = std::fs::read(&log)?.len();
+            backend.submit(&session, prompt, prompt).await?;
+            let request = wait_question(received, RequestKind::AsyncQuestions).await?;
+            if !active {
+                wait_finished(received, &session).await?;
+            }
+            assert_eq!(request.questions.len(), 2);
+            assert_eq!(request.questions[0].title, request.questions[1].title);
+            assert_ne!(request.questions[0].id, request.questions[1].id);
+            // Keep the editor open while another client submits both answers.
+            input.write_all(b"\x1b[1;3A").await?;
+            wait_terminal_text(&log, before, "color?").await?;
+            assert_eq!(backend.working(&session).await, active);
+            let before = std::fs::read(&log)?.len();
+            let answers = BTreeMap::from([
+                (request.questions[0].id.clone(), "Blue"),
+                (request.questions[1].id.clone(), "紫色CUSTOMANSWER42"),
+            ]);
+            let answer = serde_json::to_string(&answers)?;
+            let mut notices = observer.notices.subscribe();
+            backend.respond(&session, &request.id, &answer).await?;
+            if !active {
+                wait_finished(received, &session).await?;
+            } else {
+                // A steer acknowledgment only confirms queueing. Wait until the
+                // native runtime commits the reply, while work is still active.
+                tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                    loop {
+                        let notice = notices.recv().await?;
+                        if notice["method"] == "item/completed"
+                            && notice["params"]["item"]["type"] == "userMessage"
+                            && notice["params"]["item"]["clientId"]
+                                == format!("answer:{}", request.id)
+                        {
+                            break Ok::<_, anyhow::Error>(());
+                        }
+                    }
+                })
+                .await??;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            assert!(store.request(&request.id).await.is_err());
+            assert!(
+                backend
+                    .respond(&session, &request.id, &answer)
+                    .await
+                    .is_err()
+            );
+            wait_terminal_text(&log, before, "CUSTOMANSWER42").await?;
+            if active {
+                assert!(backend.working(&session).await);
+            }
+
+            // A stale editor would consume this input and submit Blue again.
+            // With both questions resolved, navigation leaves ordinary input usable.
+            input.write_all(b"\x1b[1;3A").await?;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let followup = format!("AFTER ASYNC ANSWERS {active}");
+            input.write_all(followup.as_bytes()).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            input.write_all(b"\r").await?;
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    let event = received.recv().await?;
+                    if event.session == session.id
+                        && matches!(event.kind, EventKind::User)
+                        && event.text == followup
+                    {
+                        break Ok::<_, anyhow::Error>(());
+                    }
+                }
+            })
+            .await
+            .context("Native editor consumed the follow-up as another answer")??;
+            wait_finished(received, &session).await?;
+            backend.history(&session).await?;
+            assert!(
+                store
+                    .history(&session.id, 100, 0)
+                    .await?
+                    .iter()
+                    .any(|e| matches!(e.kind, EventKind::User) && e.text == followup),
+                "remote answers must dismiss their native editors"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    observer.close();
+    drop(input);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await??;
+    anyhow::ensure!(status.success(), "Async-question terminal failed");
+    result
+}
+
+async fn wait_terminal_text(path: &std::path::Path, start: usize, text: &str) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if std::fs::read(path).ok().is_some_and(|bytes| {
+                bytes
+                    .get(start..)
+                    .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(text))
+            }) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("Terminal did not display {text:?}"))?;
     Ok(())
 }

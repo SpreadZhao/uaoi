@@ -682,7 +682,7 @@ impl AgentAdapter for Codex {
                 .await
                 .map_err(|e| OutcomeUnknown(e.to_string()))?;
         } else {
-            let text = answer_text(&pending.view, &result);
+            let text = async_answer_text(&pending.view, &result);
             let mut p = json!({"threadId":s.native,"input":[{"type":"text","text":text,"text_elements":[]}],"clientUserMessageId":format!("answer:{id}")});
             if let Some(turn) = current_turn(&r, &s.native).await? {
                 p["expectedTurnId"] = json!(turn);
@@ -1188,6 +1188,25 @@ fn answer_text(request: &PendingRequest, result: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+fn async_answer_text(request: &PendingRequest, result: &Value) -> String {
+    let replies: Vec<_> = request
+        .questions
+        .iter()
+        .map(|q| {
+            json!({
+                "questionItemId": q.id,
+                "question": q.title,
+                "answer": result["answers"][&q.id]["answers"][0],
+            })
+        })
+        .collect();
+    // The native TUI uses this envelope to render answers and dismiss the
+    // matching async editors, including when it replays the conversation.
+    format!(
+        "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+        json!(replies)
+    )
+}
 fn native_question(method: &str, p: &Value, id: String) -> PendingRequest {
     let question = method == "item/tool/requestUserInput";
     PendingRequest {
@@ -1601,7 +1620,7 @@ async fn observe(
                         .iter()
                         .enumerate()
                         .map(|(i, q)| Question {
-                            id: i.to_string(),
+                            id: json!(["request_user_input_async", item["id"], i]).to_string(),
                             title: q["title"].as_str().unwrap_or("").into(),
                             secret: false,
                             options: q["options"]
