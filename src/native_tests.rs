@@ -69,6 +69,15 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
                 }
                 let plan_text = if prompt.contains("PLAN PROPOSAL") {
                     "<proposed_plan>\n# A test plan\nRun the unit tests.\n</proposed_plan>"
+                } else if prompt.contains("CONTINUE LEGACY") {
+                    if input
+                        .iter()
+                        .any(|v| v.to_string().contains("LEGACY CONTEXT MARKER"))
+                    {
+                        "LEGACY_CONTEXT_OK"
+                    } else {
+                        "LEGACY_CONTEXT_MISSING"
+                    }
                 } else {
                     "MOCK ANSWER"
                 };
@@ -96,9 +105,27 @@ async fn native_shared_runtime_and_answers() -> Result<()> {
         }
     });
     std::fs::write(
+        ch.join("models.json"),
+        json!({"models":[{
+            "slug":"mock-model",
+            "display_name":"mock-model",
+            "base_instructions":"You are a test assistant.",
+            "supported_reasoning_levels":[{"effort":"medium","description":"Test reasoning"}],
+            "shell_type":"shell_command",
+            "visibility":"list",
+            "supported_in_api":true,
+            "priority":0,
+            "support_verbosity":false,
+            "truncation_policy":{"mode":"tokens","limit":10000},
+            "experimental_supported_tools":[]
+        }]})
+        .to_string(),
+    )?;
+    std::fs::write(
         ch.join("config.toml"),
         format!(
             r#"model = "mock-model"
+model_catalog_json = "{}/models.json"
 model_provider = "mock"
 approval_policy = "never"
 sandbox_mode = "read-only"
@@ -119,6 +146,7 @@ enabled = false
 [projects."{}"]
 trust_level = "trusted"
 "#,
+            ch.display(),
             cwd.display()
         ),
     )?;
@@ -138,7 +166,7 @@ trust_level = "trusted"
     std::fs::create_dir_all(&personal_home)?;
     std::fs::copy(ch.join("config.toml"), personal_home.join("config.toml"))?;
     let mut personal = cfg.agents["work"].clone();
-    personal.telegram.token_env = "PERSONAL_TEST_TOKEN".into();
+    personal.telegram.token_env = Some("PERSONAL_TEST_TOKEN".into());
     personal
         .env
         .insert("CODEX_HOME".into(), personal_home.display().to_string());
@@ -157,16 +185,23 @@ trust_level = "trusted"
         .unwrap()
         .agents
         .push("personal".into());
+    // This history predates the managed runtime and has never had a binding.
+    let legacy_id = seed_native_history(&cfg.agents["work"], &cwd, home.path()).await?;
     let store = Store::open(&home.path().join("state.sqlite"))?;
     let (events, _) = tokio::sync::broadcast::channel(4096);
     let mut received = events.subscribe();
     let backend = Arc::new(Codex::new(
         Arc::new(cfg.clone()),
         store.clone(),
-        events,
+        events.clone(),
         cancel.clone(),
     ));
-    backend.start().await?;
+    backend
+        .activate("work", &std::env::vars().collect())
+        .await?;
+    backend
+        .activate("personal", &std::env::vars().collect())
+        .await?;
     let session = backend.create("work", &cwd).await?;
     let initial_status = backend.status(&session).await?;
     assert_eq!(initial_status.cwd, cwd);
@@ -309,6 +344,94 @@ trust_level = "trusted"
         json!({"threadId":session.native,"excludeTurns":true}),
     )
     .await?;
+
+    // Resume alone does not bind history. A new message binds the same native
+    // session, and subsequent Telegram input retains its original context.
+    let im = Arc::new(TitleIm::default());
+    let svc = Arc::new(Service::new(
+        Arc::new(cfg.clone()),
+        store.clone(),
+        backend.clone(),
+        vec![im.clone()],
+    ));
+    let projection_cancel = cancel.child_token();
+    let projection = tokio::spawn(
+        svc.clone()
+            .events(events.subscribe(), projection_cancel.clone()),
+    );
+    cli.request(
+        "thread/resume",
+        json!({"threadId":legacy_id,"excludeTurns":true}),
+    )
+    .await?;
+    cli.request(
+        "thread/name/set",
+        json!({"threadId":legacy_id,"name":"Existing conversation"}),
+    )
+    .await?;
+    cli.request("thread/settings/update", json!({"threadId":legacy_id,"collaborationMode":{"mode":"default","settings":{"model":"mock-model","reasoning_effort":null,"developer_instructions":null}}})).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(store.native_session("work", &legacy_id).await?.is_none());
+    assert!(im.created.lock().await.is_empty());
+    cli.request("turn/start", json!({"threadId":legacy_id,"input":[{"type":"text","text":"CONTINUE LEGACY FROM CLI","text_elements":[]}]})).await?;
+    let (legacy, target) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(s) = store.native_session("work", &legacy_id).await?
+                && let Some(target) = store.targets(&s.id).await?.into_iter().next()
+            {
+                break Ok::<_, anyhow::Error>((s, target));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert_eq!(legacy.native, legacy_id);
+    wait_finished(&mut received, &legacy).await?;
+    svc.handle(message(
+        "legacy-telegram",
+        &target,
+        "CONTINUE LEGACY FROM TELEGRAM",
+    ))
+    .await?;
+    wait_finished(&mut received, &legacy).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let pending = store.pending().await?;
+            if pending
+                .iter()
+                .filter(|d| d.target == target && d.text == "LEGACY_CONTEXT_OK")
+                .count()
+                == 2
+            {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    backend.history(&legacy).await?;
+    let history = store.history(&legacy.id, 100, 0).await?;
+    assert!(history.iter().any(|e| e.text == "LEGACY CONTEXT MARKER"));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| e.text == "LEGACY_CONTEXT_OK")
+            .count(),
+        2
+    );
+    assert_eq!(im.created.lock().await.len(), 1);
+    let mut document: BindingsDocument =
+        serde_json::from_value(svc.bindings_snapshot().await?["document"].clone())?;
+    document.bindings.clear();
+    svc.apply_bindings(document).await?;
+    cli.request("turn/start", json!({"threadId":legacy_id,"input":[{"type":"text","text":"CONTINUE LEGACY AFTER UNBIND","text_elements":[]}]})).await?;
+    wait_finished(&mut received, &legacy).await?;
+    assert!(store.targets(&legacy.id).await?.is_empty());
+    assert!(store.was_bound(&legacy.id).await?);
+    assert_eq!(im.created.lock().await.len(), 1);
+    projection_cancel.cancel();
+    projection.await?;
+
     let mut mode_notices = cli.notices.subscribe();
     backend.set_mode(&session, SessionMode::Plan).await?;
     assert_eq!(
@@ -505,8 +628,7 @@ trust_level = "trusted"
         .await?;
     wait_finished(&mut received, &session).await?;
 
-    // Seed native history outside the gateway. Neither its existence nor a CLI
-    // resume may create a binding, even when its cwd is outside prior sessions.
+    // Messages outside configured projects never create a binding.
     let mut engine = None;
     for entry in std::fs::read_dir(cfg.runtime())? {
         let path = entry?.path().join("engine.sock");
@@ -551,17 +673,89 @@ trust_level = "trusted"
     cli.request("turn/start", json!({"threadId":unbound_id,"input":[{"type":"text","text":"HOLD FOR STEER","text_elements":[]}]})).await?;
     assert!(
         backend.busy().await,
-        "unbound native work also prevents shutdown"
+        "unbound native work is included in runtime status"
     );
     assert!(store.native_session("work", unbound_id).await?.is_none());
     wait_native_finished(&mut engine_notices, unbound_id).await?;
     assert!(store.native_session("work", unbound_id).await?.is_none());
     assert!(!backend.busy().await);
     backend.close("cli-b").await;
+    backend
+        .submit(&session, "HOLD FOR STEER", "shutdown-active-turn")
+        .await?;
+    assert!(backend.busy().await);
+    backend.deactivate("work").await;
+    assert!(backend.status(&session).await.is_err());
+    assert!(
+        backend.create("work", &cwd).await.is_err(),
+        "queries must never restart an offline runtime"
+    );
+    let other = backend.create("personal", &cwd).await?;
+    assert!(
+        backend.status(&other).await.is_ok(),
+        "other profiles keep working"
+    );
+    backend
+        .activate("work", &std::env::vars().collect())
+        .await?;
+    backend.restore("work", &session.native).await?;
+    assert!(backend.status(&session).await.is_ok());
     backend.shutdown().await;
     cancel.cancel();
     server.abort();
     Ok(())
+}
+async fn seed_native_history(
+    spec: &crate::config::AgentSpec,
+    cwd: &std::path::Path,
+    home: &std::path::Path,
+) -> Result<String> {
+    let socket = home.join("seed.sock");
+    let mut child = tokio::process::Command::new(&spec.command[0])
+        .args(&spec.command[1..])
+        .args([
+            "app-server",
+            "--listen",
+            &format!("unix://{}", socket.display()),
+        ])
+        .envs(&spec.env)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let rpc = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(rpc) = Rpc::open(&socket).await {
+                break rpc;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    rpc.initialize().await?;
+    let thread = rpc.request("thread/start", json!({"cwd":cwd})).await?;
+    let native = thread["thread"]["id"]
+        .as_str()
+        .context("Missing seeded thread ID")?
+        .to_owned();
+    let mut notices = rpc.notices.subscribe();
+    rpc.request("turn/start", json!({"threadId":native,"input":[{"type":"text","text":"LEGACY CONTEXT MARKER","text_elements":[]}]})).await?;
+    wait_native_finished(&mut notices, &native).await?;
+    rpc.close();
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .is_err()
+    {
+        child.kill().await?;
+    }
+    Ok(native)
 }
 async fn wait_native_finished(
     rx: &mut tokio::sync::broadcast::Receiver<Value>,

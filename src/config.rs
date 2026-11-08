@@ -32,10 +32,13 @@ pub enum OutputMode {
     Compact,
     Verbose,
 }
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
-    pub token_env: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_env: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +51,6 @@ pub struct ProjectSpec {
 #[serde(deny_unknown_fields)]
 pub struct ProjectTelegram {
     pub group: i64,
-    pub allowed_users: Vec<i64>,
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -57,8 +59,8 @@ impl Config {
                 .with_context(|| format!("Read configuration {}", path.display()))?,
         )?;
         anyhow::ensure!(
-            cfg.version == 3,
-            "Configuration version 3 required; create a new configuration and state directory"
+            cfg.version == 4,
+            "Configuration version 4 required; create a new configuration and state directory"
         );
         anyhow::ensure!(
             !cfg.agents.is_empty(),
@@ -72,10 +74,16 @@ impl Config {
                 !a.command.is_empty() && !a.command[0].is_empty(),
                 "Agent {name}: empty command"
             );
+            let credential = match (&a.telegram.token, &a.telegram.token_env) {
+                (Some(token), None) if !token.trim().is_empty() => ("token", token),
+                (None, Some(variable)) if !variable.trim().is_empty() => ("token_env", variable),
+                _ => anyhow::bail!(
+                    "Agent {name}: configure exactly one nonempty telegram.token or telegram.token_env"
+                ),
+            };
             anyhow::ensure!(
-                !a.telegram.token_env.is_empty()
-                    && credentials.insert(a.telegram.token_env.clone()),
-                "Agent {name}: each agent requires its own Bot credential reference"
+                credentials.insert((credential.0, credential.1.clone())),
+                "Agent {name}: each agent requires its own Bot credential"
             );
         }
         let mut groups = std::collections::HashSet::new();
@@ -102,10 +110,6 @@ impl Config {
             anyhow::ensure!(
                 groups.insert(project.telegram.group),
                 "Each Telegram group must belong to exactly one project"
-            );
-            anyhow::ensure!(
-                !project.telegram.allowed_users.is_empty(),
-                "Project {name}: configure allowed_users"
             );
             let mut members = std::collections::HashSet::new();
             anyhow::ensure!(

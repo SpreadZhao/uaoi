@@ -12,23 +12,41 @@ use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
 #[derive(Default)]
-struct FakeAgent {
+pub(crate) struct FakeAgent {
     online: Mutex<Vec<String>>,
     inputs: Mutex<Vec<String>>,
     submitted: Mutex<Vec<String>>,
     responses: Mutex<Vec<String>>,
-    store: Option<Store>,
+    pub(crate) store: Option<Store>,
+    pub(crate) lifecycle: Mutex<Vec<String>>,
+    pub(crate) runtimes: Mutex<BTreeMap<String, tokio_util::sync::CancellationToken>>,
+    instances: Mutex<BTreeMap<String, tokio_util::sync::CancellationToken>>,
     listed: Mutex<Vec<SessionSummary>>,
+    described: Mutex<Vec<String>>,
+    histories: Mutex<Vec<String>>,
     management: Mutex<Vec<serde_json::Value>>,
     modes: Mutex<BTreeMap<String, SessionMode>>,
     unavailable: Vec<String>,
 }
 #[async_trait]
 impl AgentAdapter for FakeAgent {
-    async fn start(&self) -> Result<()> {
+    async fn activate(&self, name: &str, env: &BTreeMap<String, String>) -> Result<()> {
+        self.lifecycle.lock().await.push(format!("start:{name}"));
+        anyhow::ensure!(!env.contains_key("FAIL_ACTIVATE"), "Activation failed");
+        self.runtimes
+            .lock()
+            .await
+            .insert(name.into(), tokio_util::sync::CancellationToken::new());
         Ok(())
     }
+    async fn deactivate(&self, name: &str) {
+        self.lifecycle.lock().await.push(format!("stop:{name}"));
+        if let Some(cancel) = self.runtimes.lock().await.remove(name) {
+            cancel.cancel();
+        }
+    }
     async fn describe(&self, session: &Session) -> Result<SessionSummary> {
+        self.described.lock().await.push(session.native.clone());
         Ok(self
             .listed
             .lock()
@@ -80,23 +98,44 @@ impl AgentAdapter for FakeAgent {
 
     async fn open(
         &self,
-        _: &str,
-        _: &str,
-        _: &std::path::Path,
-        _: &BTreeMap<String, String>,
-        _: &[std::ffi::OsString],
+        instance: &str,
+        name: &str,
+        cwd: &std::path::Path,
+        env: &BTreeMap<String, String>,
+        args: &[std::ffi::OsString],
     ) -> Result<LaunchPlan> {
-        unreachable!()
+        let runtime = self
+            .runtimes
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Offline"))?;
+        self.instances
+            .lock()
+            .await
+            .insert(instance.into(), runtime.child_token());
+        let mut command = vec!["python3".into(), "-c".into(), "import os,sys,time; gate=sys.argv[1]; open(gate+'.pid','w').write(str(os.getpid()));\nwhile os.path.exists(gate): time.sleep(.02)".into()];
+        command.extend(args.iter().map(|a| a.to_str().unwrap().to_owned()));
+        Ok(LaunchPlan {
+            command,
+            env: env.clone(),
+            cwd: cwd.into(),
+        })
     }
-    async fn close(&self, _: &str) {}
-    async fn disconnected(&self, _: &str) {
-        std::future::pending::<()>().await;
+    async fn close(&self, instance: &str) {
+        if let Some(cancel) = self.instances.lock().await.remove(instance) {
+            cancel.cancel();
+        }
     }
-    async fn active(&self, s: &Session) -> bool {
-        self.online.lock().await.contains(&s.id)
+    async fn disconnected(&self, instance: &str) {
+        let cancel = self.instances.lock().await.get(instance).cloned();
+        if let Some(cancel) = cancel {
+            cancel.cancelled().await;
+        }
     }
     async fn working(&self, s: &Session) -> bool {
-        self.active(s).await
+        self.online.lock().await.contains(&s.id)
     }
     async fn submit(&self, session: &Session, t: &str, _: &str) -> Result<()> {
         if t == "uncertain" {
@@ -147,7 +186,8 @@ impl AgentAdapter for FakeAgent {
         }
         Ok(())
     }
-    async fn history(&self, _: &Session) -> Result<()> {
+    async fn history(&self, session: &Session) -> Result<()> {
+        self.histories.lock().await.push(session.id.clone());
         Ok(())
     }
     async fn status(&self, session: &Session) -> Result<SessionStatus> {
@@ -169,13 +209,18 @@ impl AgentAdapter for FakeAgent {
             ),
         })
     }
-    async fn shutdown(&self) {}
+    async fn shutdown(&self) {
+        let names: Vec<_> = self.runtimes.lock().await.keys().cloned().collect();
+        for name in names {
+            self.deactivate(&name).await;
+        }
+    }
 }
 struct FakeIm;
 #[async_trait]
 impl ImAdapter for FakeIm {
-    fn name(&self) -> &str {
-        "test"
+    fn name(&self) -> String {
+        "test".into()
     }
     fn spaces(&self) -> Vec<Conversation> {
         vec![Conversation {
@@ -183,9 +228,6 @@ impl ImAdapter for FakeIm {
             space: "-1001".into(),
             thread: String::new(),
         }]
-    }
-    fn authorized(&self, id: &str, t: &Conversation) -> bool {
-        ["1", "3"].contains(&id) && t.space == "-1001"
     }
     fn agent(&self) -> &str {
         "work"
@@ -230,12 +272,11 @@ impl ImAdapter for FakeIm {
         Ok("42".into())
     }
 }
-fn message(id: &str, t: &Conversation, text: &str) -> Inbound {
+pub(crate) fn message(id: &str, t: &Conversation, text: &str) -> Inbound {
     Inbound {
         agent: "work".into(),
         addressed: false,
         id: id.into(),
-        sender: "1".into(),
         target: t.clone(),
         text: text.into(),
         conversation_created: false,
@@ -267,18 +308,15 @@ async fn click_card(svc: &Service, card: &Delivery, id: &str, label: &str) -> Re
     input.action = Some(card_action(card, label));
     svc.handle(input).await
 }
-fn fake_config() -> Config {
+pub(crate) fn fake_config() -> Config {
     Config {
-        version: 3,
+        version: 4,
         projects: BTreeMap::from([(
             "demo".into(),
             ProjectSpec {
                 cwd: "/tmp".into(),
                 agents: vec!["work".into()],
-                telegram: ProjectTelegram {
-                    group: -1001,
-                    allowed_users: vec![1, 3],
-                },
+                telegram: ProjectTelegram { group: -1001 },
             },
         )]),
         agents: BTreeMap::from([(
@@ -288,7 +326,8 @@ fn fake_config() -> Config {
                 command: vec!["codex".into()],
                 env: BTreeMap::new(),
                 telegram: TelegramConfig {
-                    token_env: "TEST_TOKEN".into(),
+                    token_env: Some("TEST_TOKEN".into()),
+                    ..TelegramConfig::default()
                 },
                 output: OutputMode::Compact,
             },
@@ -322,9 +361,11 @@ async fn group_topics_and_deduplication() -> Result<()> {
     svc.handle(message("a1", &ta, "first")).await?;
     svc.handle(message("a1", &ta, "first")).await?;
     svc.handle(message("b1", &tb, "second")).await?;
-    let mut unauthorized = message("evil", &ta, "evil");
-    unauthorized.sender = "2".into();
-    svc.handle(unauthorized).await?;
+    let mut outside = ta.clone();
+    outside.space = "-1002".into();
+    svc.handle(message("outside", &outside, "ignored")).await?;
+    outside.space = "2".into();
+    svc.handle(message("private", &outside, "ignored")).await?;
     assert_eq!(*agent.inputs.lock().await, vec!["first", "second"]);
     svc.ensure_topics(&a).await?;
     assert_eq!(store.targets(&a.id).await?, vec![ta]);
@@ -337,7 +378,7 @@ fn rejects_old_database_and_config() -> Result<()> {
     let path = dir.path().join("old.sqlite");
     rusqlite::Connection::open(&path)?.execute("CREATE TABLE spaces(id TEXT)", [])?;
     assert!(Store::open(&path).is_err());
-    for version in [3, 4] {
+    for version in [3, 4, 5] {
         let path = dir.path().join(format!("v{version}.sqlite"));
         let db = rusqlite::Connection::open(&path)?;
         db.pragma_update(None, "user_version", version)?;
@@ -349,12 +390,12 @@ fn rejects_old_database_and_config() -> Result<()> {
     }
     let config = dir.path().join("config.toml");
     let mut cfg = fake_config();
-    for version in [1, 2] {
+    for version in [1, 2, 3] {
         cfg.version = version;
         std::fs::write(&config, toml::to_string(&cfg)?)?;
         assert!(Config::load(&config).is_err());
     }
-    cfg.version = 3;
+    cfg.version = 4;
     std::fs::write(&config, toml::to_string(&cfg)?)?;
     Config::load(&config)?;
     let mut old = toml::Value::try_from(cfg)?;
@@ -522,14 +563,11 @@ struct TitleIm {
 }
 #[async_trait]
 impl ImAdapter for TitleIm {
-    fn name(&self) -> &str {
+    fn name(&self) -> String {
         FakeIm.name()
     }
     fn spaces(&self) -> Vec<Conversation> {
         FakeIm.spaces()
-    }
-    fn authorized(&self, id: &str, target: &Conversation) -> bool {
-        FakeIm.authorized(id, target)
     }
     fn agent(&self) -> &str {
         FakeIm.agent()
@@ -932,7 +970,7 @@ fn configuration_validates_projects_and_explicit_agents() -> Result<()> {
         validate(&cfg).is_err(),
         "each agent requires its own Bot reference"
     );
-    cfg.agents.get_mut("personal").unwrap().telegram.token_env = "PERSONAL_TOKEN".into();
+    cfg.agents.get_mut("personal").unwrap().telegram.token_env = Some("PERSONAL_TOKEN".into());
     cfg.projects
         .get_mut("demo")
         .unwrap()
@@ -1011,10 +1049,15 @@ async fn question_navigation_preserves_shared_drafts_and_leaves_task_input_alone
     store.delivery(&initial, "sent", Some("99".into())).await?;
     svc.handle(message("ordinary", &target, "keep working"))
         .await?;
-    let mut unauthorized = message("other-user", &target, "not my answer");
-    unauthorized.sender = "2".into();
-    unauthorized.reply_to = Some("99".into());
-    svc.handle(unauthorized).await?;
+    let mut first_reply = message("other-user", &target, "/tmp/another-member");
+    first_reply.reply_to = Some("99".into());
+    svc.handle(first_reply).await?;
+    assert!(
+        question_card(&store, "direct")
+            .await?
+            .text
+            .contains("/tmp/another-member")
+    );
     let mut reply = message("directory-answer", &target, "/tmp/project");
     reply.reply_to = Some("99".into());
     svc.handle(reply).await?;
@@ -1039,7 +1082,6 @@ async fn question_navigation_preserves_shared_drafts_and_leaves_task_input_alone
     click_card(&svc, &review, "edit-first", "1 ✓").await?;
     let mut reply = message("directory-revised", &target, "/tmp/revised");
     reply.reply_to = Some("99".into());
-    reply.sender = "3".into();
     svc.handle(reply).await?;
     let revised = question_card(&store, "direct").await?;
     click_card(&svc, &revised, "review-revised", "Review answers").await?;
@@ -1047,7 +1089,7 @@ async fn question_navigation_preserves_shared_drafts_and_leaves_task_input_alone
     assert!(reviewed.text.contains("/tmp/revised"));
     assert!(
         reviewed.text.contains("中文备注"),
-        "another authorized participant must see the same draft"
+        "all group members share the same draft"
     );
     assert!(agent.responses.lock().await.is_empty());
     click_card(&svc, &reviewed, "submit-replies", "Submit answers").await?;
@@ -1284,7 +1326,7 @@ async fn long_question_cards_stay_single_and_uncertain_answers_cannot_be_resubmi
 }
 
 #[tokio::test]
-async fn new_requires_a_directory_and_agents_only_links_bound_sessions() -> Result<()> {
+async fn new_uses_project_directory_and_agents_only_links_bound_sessions() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(&dir.path().join("state.sqlite"))?;
     let agent = Arc::new(FakeAgent {
@@ -1301,20 +1343,18 @@ async fn new_requires_a_directory_and_agents_only_links_bound_sessions() -> Resu
     );
     let group = FakeIm.spaces().remove(0);
     for (id, input) in [
-        ("empty", "/new"),
         ("relative", "/new relative/path"),
         ("missing", "/new /uaoi-test-nonexistent-dir"),
     ] {
         svc.handle(message(id, &group, input)).await?;
     }
     assert!(agent.management.lock().await.is_empty());
-    let mut create = message(
-        "new",
-        &group,
-        &format!("/new@WorkBot {}", dir.path().display()),
-    );
-    create.addressed = true;
-    svc.handle(create).await?;
+    svc.handle(message("new", &group, "/new")).await?;
+    let created = agent.management.lock().await;
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["op"], "create");
+    assert_eq!(created[0]["cwd"], dir.path().to_str().unwrap());
+    drop(created);
     let bound = store.bindings().await?.1.remove(0);
     let cwd = dir.path().join("not-present-anymore");
     let hidden = store.ensure_session("work", "unbound-history").await?;
@@ -1408,6 +1448,7 @@ async fn binding_edits_are_versioned_and_unbinding_stops_projection() -> Result<
     }];
     svc.apply_bindings(document).await?;
     assert!(store.targets(&first.id).await?.is_empty());
+    assert!(svc.ensure_topics(&first).await.is_err());
     assert!(!store.delivery_current(&queued).await?);
     assert!(store.read_action(&action, &old.target).await.is_err());
     let next = store.bindings().await?.1.remove(0);
@@ -1445,6 +1486,45 @@ async fn binding_edits_are_versioned_and_unbinding_stops_projection() -> Result<
 }
 
 #[tokio::test]
+async fn binding_history_survives_explicit_unbinding_and_restart() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("state.sqlite");
+    let store = Store::open(&path)?;
+    let automatic = store.ensure_session("work", "automatic").await?;
+    let explicit = store.ensure_session("work", "explicit").await?;
+    let never_bound = store.ensure_session("work", "never-bound").await?;
+    assert!(!store.was_bound(&automatic.id).await?);
+    let target = Conversation {
+        platform: "test".into(),
+        space: "-1001".into(),
+        thread: "first".into(),
+    };
+    store.bind(&target, &automatic.id).await?;
+    let revision = store.bindings().await?.0;
+    store
+        .replace_bindings(
+            revision,
+            vec![BindingRecord {
+                session: explicit.clone(),
+                target: Conversation {
+                    thread: "second".into(),
+                    ..target
+                },
+            }],
+        )
+        .await?;
+    let revision = store.bindings().await?.0;
+    store.replace_bindings(revision, vec![]).await?;
+    drop(store);
+    let reopened = Store::open(&path)?;
+    assert!(reopened.bindings().await?.1.is_empty());
+    assert!(reopened.was_bound(&automatic.id).await?);
+    assert!(reopened.was_bound(&explicit.id).await?);
+    assert!(!reopened.was_bound(&never_bound.id).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_binding_documents_never_allocate_topics() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = Store::open(&dir.path().join("state.sqlite"))?;
@@ -1460,7 +1540,7 @@ async fn invalid_binding_documents_never_allocate_topics() -> Result<()> {
         vec![im.clone()],
     );
     let document = BindingsDocument {
-        version: 2,
+        version: 3,
         revision: 0,
         bindings: ["valid-native-id", "missing-native-id"]
             .into_iter()
@@ -1477,5 +1557,128 @@ async fn invalid_binding_documents_never_allocate_topics() -> Result<()> {
     let (revision, bindings) = store.bindings().await?;
     assert_eq!(revision, 0);
     assert!(bindings.is_empty());
+    Ok(())
+}
+
+#[test]
+fn configuration_accepts_exactly_one_telegram_credential_source() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    let mut cfg = fake_config();
+    let validate = |cfg: &Config| -> Result<Config> {
+        std::fs::write(&path, toml::to_string(cfg)?)?;
+        Config::load(&path)
+    };
+    let inline = TelegramConfig {
+        token: Some("123456:example-test-token".into()),
+        token_env: None,
+    };
+    cfg.agents.get_mut("work").unwrap().telegram = inline.clone();
+    let parsed = validate(&cfg)?;
+    assert_eq!(parsed.agents["work"].telegram.token, inline.token);
+    assert!(parsed.agents["work"].telegram.token_env.is_none());
+    for invalid in [
+        TelegramConfig::default(),
+        TelegramConfig {
+            token: Some(String::new()),
+            token_env: None,
+        },
+        TelegramConfig {
+            token: None,
+            token_env: Some(" ".into()),
+        },
+        TelegramConfig {
+            token: inline.token.clone(),
+            token_env: Some("TOKEN_ENV".into()),
+        },
+    ] {
+        cfg.agents.get_mut("work").unwrap().telegram = invalid;
+        let error = validate(&cfg)
+            .err()
+            .expect("invalid credential source accepted")
+            .to_string();
+        assert!(error.contains("exactly one"));
+        assert!(
+            !error.contains("example-test-token"),
+            "validation must not disclose credentials"
+        );
+    }
+    cfg.agents.get_mut("work").unwrap().telegram = inline;
+    cfg.agents
+        .insert("other".into(), cfg.agents["work"].clone());
+    let error = validate(&cfg)
+        .err()
+        .expect("duplicate token accepted")
+        .to_string();
+    assert!(error.contains("own Bot credential"));
+    assert!(!error.contains("example-test-token"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn project_commands_work_in_general_and_session_arguments_are_validated() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let store = Store::open(&dir.path().join("state.sqlite"))?;
+    let agent = Arc::new(FakeAgent {
+        store: Some(store.clone()),
+        ..Default::default()
+    });
+    let cfg = Arc::new(fake_config());
+    let svc = Service::new(
+        cfg.clone(),
+        store.clone(),
+        agent.clone(),
+        vec![Arc::new(FakeIm)],
+    );
+    let general = FakeIm.spaces().remove(0);
+    svc.handle(message("project-status", &general, "/status"))
+        .await?;
+    let status = store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key == "project-status:0")
+        .unwrap();
+    assert!(status.text.contains("Project: demo") && status.text.contains("Directory: /tmp"));
+    assert!(status.text.contains("Bound sessions: 0") && status.text.contains("work: online"));
+    assert!(agent.described.lock().await.is_empty());
+    svc.handle(message("project-help", &general, "/help"))
+        .await?;
+    let help = store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key == "project-help:0")
+        .unwrap();
+    assert!(help.text.contains("Directory: /tmp") && help.text.contains("/new —"));
+    assert!(!help.text.contains("absolute directory"));
+    svc.handle(message("unknown", &general, "/not-a-command"))
+        .await?;
+    assert_eq!(
+        store.operation_record("unknown").await?.unwrap().0,
+        "rejected"
+    );
+    let session = store.ensure_session("work", "command-validation").await?;
+    svc.ensure_topics(&session).await?;
+    let topic = store.targets(&session.id).await?.remove(0);
+    for (i, command) in [
+        "/new /tmp",
+        "/status extra",
+        "/help extra",
+        "/stop all",
+        "/history -1",
+        "/history wrong",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("invalid-{i}");
+        svc.handle(message(&id, &topic, command)).await?;
+        assert_eq!(store.operation_record(&id).await?.unwrap().0, "rejected");
+    }
+    assert!(agent.histories.lock().await.is_empty());
+    assert!(agent.management.lock().await.is_empty());
+    svc.handle(message("history", &topic, "/history 0")).await?;
+    assert_eq!(*agent.histories.lock().await, vec![session.id]);
     Ok(())
 }

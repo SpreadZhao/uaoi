@@ -24,20 +24,15 @@ let
   configured = evaluate {
     enable = true;
     settings = {
-      version = 3;
+      version = 4;
       agents = { };
       projects = { };
     };
   };
-  persistent = evaluate {
-    enable = true;
-    service.enable = true;
-    service.environmentFile = "/run/secrets/uaoi.env";
-  };
 in
 assert !(installed.systemd.user.services ? uaoi);
 assert configured.xdg.configFile ? "uaoi/config.toml";
-assert persistent.systemd.user.services.uaoi.Service.EnvironmentFile == "/run/secrets/uaoi.env";
+assert !(configured.systemd.user.services ? uaoi);
 pkgs.runCommand "uaoi-home-manager-check" { } ''
   test -n '${configured.xdg.configFile."uaoi/config.toml".source}'
   touch "$out"

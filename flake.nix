@@ -29,10 +29,14 @@
         ];
         instructions = ''
           # uaoi development
-          uaoi is a Rust CLI wrapper with a persistent broker, shared native runtimes, IM and agent adapters.
+          uaoi is a Rust agent wrapper with an instance-owned broker, shared native runtimes, IM and agent adapters.
+          Each interactive uaoi invocation is one instance. An agent runs while it has instances; the broker exits after the last instance.
           Keep platform identifiers and native agent protocols in their adapters.
           Projects configure exact creation directories and groups; agents own Bots and shared native runtimes.
           Route existing sessions by explicit topic bindings, never by cwd changes or background discovery.
+          First binding follows a new live message from a never-bound session in a configured project; opening history alone does not bind.
+          Telegram commands stay within the current project group; /new uses its configured directory.
+          All project group members may control sessions; do not add user allowlists.
           Keep documentation, comments and CLI help in English.
           Maintain instructions here in flake.nix; NAW generates AGENTS.md.
           Never run NixOS or Home Manager switch commands.

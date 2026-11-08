@@ -11,7 +11,23 @@ pub enum SendFailure {
 }
 #[async_trait]
 pub trait ImAdapter: Send + Sync {
-    fn name(&self) -> &str;
+    fn name(&self) -> String;
+    fn enabled(&self) -> bool {
+        true
+    }
+    fn started(&self) -> u64 {
+        0
+    }
+    async fn activate(&self, _env: &std::collections::BTreeMap<String, String>) -> Result<()> {
+        Ok(())
+    }
+    async fn deactivate(&self) {}
+    async fn clear_commands(
+        &self,
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn spaces(&self) -> Vec<Conversation>;
     fn agent(&self) -> &str;
     fn project(&self, target: &Conversation) -> Option<&str>;
@@ -35,6 +51,5 @@ pub trait ImAdapter: Send + Sync {
     async fn set_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
         Ok(())
     }
-    fn authorized(&self, sender: &str, target: &Conversation) -> bool;
     fn link(&self, target: &Conversation) -> String;
 }

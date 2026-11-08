@@ -7,22 +7,26 @@ use async_trait::async_trait;
 
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
-    async fn start(&self) -> Result<()>;
+    async fn activate(
+        &self,
+        agent: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()>;
+    async fn deactivate(&self, agent: &str);
     async fn describe(&self, session: &Session) -> Result<SessionSummary>;
     async fn restore(&self, agent: &str, native: &str) -> Result<Session>;
     async fn create(&self, agent: &str, cwd: &std::path::Path) -> Result<Session>;
     async fn busy(&self) -> bool;
     async fn open(
         &self,
-        client: &str,
+        instance: &str,
         agent: &str,
         cwd: &std::path::Path,
         env: &std::collections::BTreeMap<String, String>,
         args: &[std::ffi::OsString],
     ) -> Result<LaunchPlan>;
-    async fn close(&self, client: &str);
-    async fn disconnected(&self, client: &str);
-    async fn active(&self, session: &Session) -> bool;
+    async fn close(&self, instance: &str);
+    async fn disconnected(&self, instance: &str);
     async fn working(&self, session: &Session) -> bool;
     async fn submit(&self, session: &Session, text: &str, input_id: &str) -> Result<()>;
     async fn set_mode(&self, session: &Session, mode: SessionMode) -> Result<()>;

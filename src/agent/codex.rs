@@ -1,3 +1,6 @@
+mod gateway;
+use gateway::gateway;
+
 use super::{
     AgentAdapter, OutcomeUnknown, codex_cli,
     rpc::{self, Rpc},
@@ -5,7 +8,6 @@ use super::{
 use crate::{config::Config, model::*, store::Store};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -18,7 +20,6 @@ use tokio::{
     process::{Child, Command},
     sync::{Mutex, broadcast},
 };
-use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 pub struct Codex {
@@ -26,7 +27,7 @@ pub struct Codex {
     store: Store,
     events: broadcast::Sender<AgentEvent>,
     runtimes: Mutex<HashMap<String, Arc<Runtime>>>,
-    clients: Mutex<HashMap<String, (CancellationToken, PathBuf)>>,
+    instances: Mutex<HashMap<String, (CancellationToken, PathBuf)>>,
     cancel: CancellationToken,
 }
 struct Runtime {
@@ -38,15 +39,21 @@ struct Runtime {
     child: Mutex<AgentProcess>,
     attach_gate: Mutex<()>,
     input_gate: Mutex<()>,
-    sessions: Mutex<HashMap<String, Session>>,
-    subscriptions: Mutex<HashSet<String>>,
-    turns: Mutex<HashMap<String, String>>,
-    starting: Mutex<HashSet<String>>,
-    modes: Mutex<HashMap<String, Value>>,
-    plans: Mutex<HashMap<String, (String, String)>>,
+    threads: Mutex<HashMap<String, ThreadState>>,
     requests: Mutex<HashMap<String, NativeRequest>>,
     answered: Mutex<HashSet<String>>,
-    pending_bindings: Mutex<HashMap<String, PathBuf>>,
+}
+// A thread may be an unregistered draft, a cached session, or subscribed live.
+// These facts are independent: opening a draft/history must not publish it.
+#[derive(Default)]
+struct ThreadState {
+    session: Option<Session>,
+    subscribed: bool,
+    starting: bool,
+    turn: Option<String>,
+    mode: Option<Value>,
+    plan: Option<(String, String)>,
+    draft_directory: Option<PathBuf>,
 }
 #[derive(Clone)]
 struct NativeRequest {
@@ -57,19 +64,35 @@ struct NativeRequest {
 }
 struct AgentProcess {
     child: Child,
+    group: Option<i32>,
     dir: PathBuf,
 }
 impl Drop for AgentProcess {
     fn drop(&mut self) {
-        if let Some(pid) = self.child.id() {
+        if let Some(group) = self.group.take() {
             unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::kill(-group, libc::SIGKILL);
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 impl Codex {
+    pub(crate) async fn active(&self, s: &Session) -> bool {
+        let r = self.runtimes.lock().await.get(&s.agent).cloned();
+        if let Some(r) = r {
+            !r.cancel.is_cancelled()
+                && r.rpc.connected()
+                && r.threads
+                    .lock()
+                    .await
+                    .get(&s.native)
+                    .is_some_and(|thread| thread.session.is_some())
+        } else {
+            false
+        }
+    }
+
     pub fn new(
         cfg: Arc<Config>,
         store: Store,
@@ -81,25 +104,41 @@ impl Codex {
             store,
             events,
             runtimes: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
+            instances: Mutex::new(HashMap::new()),
             cancel,
         }
     }
     async fn runtime(&self, agent: &str) -> Result<Arc<Runtime>> {
-        let mut runtimes = self.runtimes.lock().await;
-        if let Some(r) = runtimes.get(agent)
+        self.runtimes
+            .lock()
+            .await
+            .get(agent)
+            .filter(|r| !r.cancel.is_cancelled())
+            .cloned()
+            .with_context(|| format!("Agent {agent} is offline; open uaoi --agent {agent} first"))
+    }
+    async fn start_runtime(
+        &self,
+        agent: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Arc<Runtime>> {
+        if let Some(r) = self.runtimes.lock().await.get(agent)
             && !r.cancel.is_cancelled()
         {
             return Ok(r.clone());
         }
-        if let Some(old) = runtimes.remove(agent) {
+        let old = self.runtimes.lock().await.remove(agent);
+        if let Some(old) = old {
             stop(&old).await;
         }
         let spec = self.cfg.agents.get(agent).context("Unknown agent")?;
         let version = Command::new(&spec.command[0])
             .args(&spec.command[1..])
             .arg("--version")
+            .env_clear()
+            .envs(env)
             .envs(&spec.env)
+            .kill_on_drop(true)
             .output()
             .await?;
         let version = String::from_utf8_lossy(&version.stdout);
@@ -131,6 +170,8 @@ impl Codex {
                 "--listen",
                 &format!("unix://{}", engine.display()),
             ])
+            .env_clear()
+            .envs(env)
             .envs(&spec.env)
             .current_dir(&dir)
             .stdin(std::process::Stdio::null())
@@ -147,8 +188,10 @@ impl Codex {
                 Ok(())
             });
         }
+        let spawned = cmd.spawn()?;
         let mut child = AgentProcess {
-            child: cmd.spawn()?,
+            group: spawned.id().map(|pid| pid as i32),
+            child: spawned,
             dir,
         };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -175,15 +218,9 @@ impl Codex {
             child: Mutex::new(child),
             attach_gate: Mutex::new(()),
             input_gate: Mutex::new(()),
-            sessions: Mutex::new(HashMap::new()),
-            subscriptions: Mutex::new(HashSet::new()),
-            turns: Mutex::new(HashMap::new()),
-            starting: Mutex::new(HashSet::new()),
-            modes: Mutex::new(HashMap::new()),
-            plans: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
             answered: Mutex::new(HashSet::new()),
-            pending_bindings: Mutex::new(HashMap::new()),
         });
         tokio::spawn(observe(
             r.clone(),
@@ -192,7 +229,7 @@ impl Codex {
             notices,
         ));
         tokio::spawn(supervise(r.clone()));
-        runtimes.insert(agent.into(), r.clone());
+        self.runtimes.lock().await.insert(agent.into(), r.clone());
         Ok(r)
     }
     async fn attached(&self, s: &Session) -> Result<Arc<Runtime>> {
@@ -219,7 +256,12 @@ impl Codex {
                 json!({"threadId":s.native,"collaborationMode":selected}),
             )
             .await?;
-        r.modes.lock().await.insert(s.native.clone(), selected);
+        r.threads
+            .lock()
+            .await
+            .entry(s.native.clone())
+            .or_default()
+            .mode = Some(selected);
         invalidate(
             &r,
             &self.store,
@@ -259,7 +301,12 @@ impl Codex {
             }
             start_turn(&r, p).await?;
             if let Some(mode) = selected {
-                r.modes.lock().await.insert(s.native.clone(), mode);
+                r.threads
+                    .lock()
+                    .await
+                    .entry(s.native.clone())
+                    .or_default()
+                    .mode = Some(mode);
             }
         }
         invalidate(
@@ -293,11 +340,20 @@ impl Codex {
 }
 #[async_trait]
 impl AgentAdapter for Codex {
-    async fn start(&self) -> Result<()> {
-        for name in self.cfg.agents.keys() {
-            self.runtime(name).await?;
-        }
-        for record in self.store.bindings().await?.1 {
+    async fn activate(
+        &self,
+        agent: &str,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.start_runtime(agent, env).await?;
+        for record in self
+            .store
+            .bindings()
+            .await?
+            .1
+            .into_iter()
+            .filter(|r| r.session.agent == agent)
+        {
             if let Err(error) = self
                 .restore(&record.session.agent, &record.session.native)
                 .await
@@ -306,6 +362,13 @@ impl AgentAdapter for Codex {
             }
         }
         Ok(())
+    }
+    async fn deactivate(&self, agent: &str) {
+        let runtime = self.runtimes.lock().await.remove(agent);
+        if let Some(runtime) = runtime {
+            runtime.cancel.cancel();
+            stop(&runtime).await;
+        }
     }
     async fn describe(&self, s: &Session) -> Result<SessionSummary> {
         let r = self.runtime(&s.agent).await?;
@@ -332,7 +395,12 @@ impl AgentAdapter for Codex {
         let result = r.rpc.request("thread/start", json!({"cwd":cwd})).await?;
         let session = register(&r, &self.store, &result["thread"]).await?;
         remember_mode(&r, &session.native, &result).await;
-        r.subscriptions.lock().await.insert(session.native.clone());
+        r.threads
+            .lock()
+            .await
+            .entry(session.native.clone())
+            .or_default()
+            .subscribed = true;
         announce(&self.store, &self.events, &session).await?;
         Ok(session)
     }
@@ -342,10 +410,15 @@ impl AgentAdapter for Codex {
             if r.cancel.is_cancelled() {
                 continue;
             }
-            if !r.starting.lock().await.is_empty() {
+            if r.threads
+                .lock()
+                .await
+                .values()
+                .any(|thread| thread.starting)
+            {
                 return true;
             }
-            // Stopping must also protect work in deliberately unbound sessions.
+            // Status includes work in deliberately unbound sessions.
             // This read-only check never imports or binds native history.
             let mut cursor = Value::Null;
             loop {
@@ -382,7 +455,7 @@ impl AgentAdapter for Codex {
     }
     async fn open(
         &self,
-        client: &str,
+        instance: &str,
         agent: &str,
         cwd: &Path,
         env: &std::collections::BTreeMap<String, String>,
@@ -401,10 +474,10 @@ impl AgentAdapter for Codex {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let cancel = r.cancel.child_token();
-        self.clients
+        self.instances
             .lock()
             .await
-            .insert(client.into(), (cancel.clone(), path.clone()));
+            .insert(instance.into(), (cancel.clone(), path.clone()));
         let (store, events) = (self.store.clone(), self.events.clone());
         let gateway_cwd = cwd.to_owned();
         tokio::spawn(async move {
@@ -439,31 +512,21 @@ impl AgentAdapter for Codex {
             cwd: cwd.into(),
         })
     }
-    async fn close(&self, client: &str) {
-        if let Some((cancel, path)) = self.clients.lock().await.remove(client) {
+    async fn close(&self, instance: &str) {
+        if let Some((cancel, path)) = self.instances.lock().await.remove(instance) {
             cancel.cancel();
             let _ = std::fs::remove_file(path);
         }
     }
-    async fn disconnected(&self, client: &str) {
+    async fn disconnected(&self, instance: &str) {
         let cancel = self
-            .clients
+            .instances
             .lock()
             .await
-            .get(client)
+            .get(instance)
             .map(|(c, _)| c.clone());
         if let Some(cancel) = cancel {
             cancel.cancelled().await;
-        }
-    }
-    async fn active(&self, s: &Session) -> bool {
-        let r = self.runtimes.lock().await.get(&s.agent).cloned();
-        if let Some(r) = r {
-            !r.cancel.is_cancelled()
-                && r.rpc.connected()
-                && r.sessions.lock().await.contains_key(&s.native)
-        } else {
-            false
         }
     }
     async fn working(&self, s: &Session) -> bool {
@@ -473,7 +536,14 @@ impl AgentAdapter for Codex {
         let Some(r) = self.runtimes.lock().await.get(&s.agent).cloned() else {
             return false;
         };
-        if r.cancel.is_cancelled() || !r.sessions.lock().await.contains_key(&s.native) {
+        if r.cancel.is_cancelled()
+            || !r
+                .threads
+                .lock()
+                .await
+                .get(&s.native)
+                .is_some_and(|thread| thread.session.is_some())
+        {
             return false;
         }
         let Ok(result) = r
@@ -549,11 +619,11 @@ impl AgentAdapter for Codex {
                 "This plan has been superseded"
             );
             let mode = r
-                .modes
+                .threads
                 .lock()
                 .await
                 .get(&s.native)
-                .cloned()
+                .and_then(|thread| thread.mode.clone())
                 .context("Missing collaboration mode")?;
             anyhow::ensure!(mode["mode"] == "plan", "Session is no longer in Plan mode");
             if answer == "execute" {
@@ -674,10 +744,11 @@ impl AgentAdapter for Codex {
             ));
         }
         let mode = r
-            .modes
+            .threads
             .lock()
             .await
             .get(&s.native)
+            .and_then(|thread| thread.mode.as_ref())
             .and_then(|m| match m["mode"].as_str() {
                 Some("plan") => Some(SessionMode::Plan),
                 Some("default") => Some(SessionMode::Default),
@@ -693,13 +764,13 @@ impl AgentAdapter for Codex {
         })
     }
     async fn shutdown(&self) {
-        for (_, (cancel, path)) in self.clients.lock().await.drain() {
+        for (_, (cancel, path)) in self.instances.lock().await.drain() {
             cancel.cancel();
             let _ = std::fs::remove_file(path);
         }
-        for r in self.runtimes.lock().await.values() {
-            r.cancel.cancel();
-            stop(r).await;
+        let agents: Vec<_> = self.runtimes.lock().await.keys().cloned().collect();
+        for agent in agents {
+            self.deactivate(&agent).await;
         }
     }
 }
@@ -711,10 +782,20 @@ async fn remember_mode(r: &Runtime, native: &str, result: &Value) {
     } else {
         return;
     };
-    r.modes.lock().await.insert(native.into(), mode);
+    r.threads
+        .lock()
+        .await
+        .entry(native.into())
+        .or_default()
+        .mode = Some(mode);
 }
 async fn current_mode(r: &Runtime, s: &Session) -> Result<Value> {
-    if !r.modes.lock().await.contains_key(&s.native) {
+    if r.threads
+        .lock()
+        .await
+        .get(&s.native)
+        .is_none_or(|thread| thread.mode.is_none())
+    {
         let resumed = r
             .rpc
             .request(
@@ -724,11 +805,11 @@ async fn current_mode(r: &Runtime, s: &Session) -> Result<Value> {
             .await?;
         remember_mode(r, &s.native, &resumed).await;
     }
-    r.modes
+    r.threads
         .lock()
         .await
         .get(&s.native)
-        .cloned()
+        .and_then(|thread| thread.mode.clone())
         .context("Session settings unavailable; reopen the session")
 }
 async fn select_mode(r: &Runtime, s: &Session, selected: SessionMode) -> Result<Value> {
@@ -742,31 +823,6 @@ async fn select_mode(r: &Runtime, s: &Session, selected: SessionMode) -> Result<
 }
 fn human_thread(t: &Value) -> bool {
     t["parentThreadId"].is_null() && (t["threadSource"].is_null() || t["threadSource"] == "user")
-}
-async fn has_user_turn(r: &Runtime, thread: &Value) -> Result<bool> {
-    if thread["preview"]
-        .as_str()
-        .is_some_and(|text| !text.trim().is_empty())
-        || thread["status"]["type"] == "active"
-        || thread["turns"]
-            .as_array()
-            .is_some_and(|turns| !turns.is_empty())
-    {
-        return Ok(true);
-    }
-    if thread["path"].is_null() {
-        return Ok(false);
-    }
-    // A persisted thread can contain only initial context and a name. Check
-    // for an actual turn before exposing it as a conversation.
-    let turns = match r.rpc.request("thread/turns/list", json!({"threadId":thread["id"],"limit":1,"sortDirection":"desc","itemsView":"notLoaded"})).await {
-        Ok(turns) => turns,
-        Err(error) if error.to_string().contains("no rollout") || error.to_string().contains("not materialized yet") => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    Ok(turns["data"]
-        .as_array()
-        .is_some_and(|turns| !turns.is_empty()))
 }
 fn summary(t: &Value) -> Option<SessionSummary> {
     if !human_thread(t) {
@@ -791,7 +847,12 @@ async fn register(r: &Runtime, store: &Store, thread: &Value) -> Result<Session>
     let info = summary(thread).context("Session is not a user conversation")?;
     let session = store.ensure_session(&r.agent, &info.native).await?;
     store.set_title(&session, thread["name"].as_str()).await?;
-    r.sessions.lock().await.insert(info.native, session.clone());
+    r.threads
+        .lock()
+        .await
+        .entry(info.native)
+        .or_default()
+        .session = Some(session.clone());
     Ok(session)
 }
 async fn announce(
@@ -816,9 +877,18 @@ async fn announce(
 }
 async fn attach(r: &Arc<Runtime>, store: &Store, native: &str) -> Result<Session> {
     let _gate = r.attach_gate.lock().await;
-    let existing = r.sessions.lock().await.get(native).cloned();
+    let existing = r
+        .threads
+        .lock()
+        .await
+        .get(native)
+        .and_then(|thread| thread.session.clone());
     if let Some(s) = &existing
-        && r.subscriptions.lock().await.contains(native)
+        && r.threads
+            .lock()
+            .await
+            .get(native)
+            .is_some_and(|thread| thread.subscribed)
     {
         return Ok(s.clone());
     }
@@ -849,7 +919,9 @@ async fn attach(r: &Arc<Runtime>, store: &Store, native: &str) -> Result<Session
     {
         Ok(v) => v,
         Err(e) => {
-            r.starting.lock().await.remove(native);
+            if let Some(thread) = r.threads.lock().await.get_mut(native) {
+                thread.starting = false;
+            }
             if e.to_string().contains("no rollout") {
                 return Ok(s);
             }
@@ -858,7 +930,12 @@ async fn attach(r: &Arc<Runtime>, store: &Store, native: &str) -> Result<Session
     };
     // Keep forwarding the creating CLI's events until the control connection
     // has actually subscribed; otherwise a short first turn can be lost.
-    r.subscriptions.lock().await.insert(native.into());
+    r.threads
+        .lock()
+        .await
+        .entry(native.into())
+        .or_default()
+        .subscribed = true;
     remember_mode(r, native, &resumed).await;
     let _ = current_turn(r, native).await;
     Ok(s)
@@ -868,16 +945,27 @@ async fn start_turn(r: &Runtime, p: Value) -> Result<Value> {
         .as_str()
         .context("Missing thread ID")?
         .to_owned();
-    r.starting.lock().await.insert(thread.clone());
+    r.threads
+        .lock()
+        .await
+        .entry(thread.clone())
+        .or_default()
+        .starting = true;
     let result = r.rpc.request("turn/start", p).await;
-    if result.as_ref().is_err_and(|e| !e.is::<OutcomeUnknown>()) {
-        r.starting.lock().await.remove(&thread);
+    if result.as_ref().is_err_and(|e| !e.is::<OutcomeUnknown>())
+        && let Some(state) = r.threads.lock().await.get_mut(&thread)
+    {
+        state.starting = false;
     }
     result
 }
 async fn current_turn(r: &Runtime, native: &str) -> Result<Option<String>> {
     anyhow::ensure!(
-        !r.starting.lock().await.contains(native),
+        !r.threads
+            .lock()
+            .await
+            .get(native)
+            .is_some_and(|thread| thread.starting),
         "The turn is starting; retry shortly"
     );
     let snapshot = match r
@@ -890,15 +978,28 @@ async fn current_turn(r: &Runtime, native: &str) -> Result<Option<String>> {
     {
         Ok(v) => v,
         Err(e) if e.to_string().contains("no rollout") => {
-            return Ok(r.turns.lock().await.get(native).cloned());
+            return Ok(r
+                .threads
+                .lock()
+                .await
+                .get(native)
+                .and_then(|thread| thread.turn.clone()));
         }
         Err(e) => return Err(e),
     };
     if snapshot["thread"]["status"]["type"] != "active" {
-        r.turns.lock().await.remove(native);
+        if let Some(thread) = r.threads.lock().await.get_mut(native) {
+            thread.turn = None;
+        }
         return Ok(None);
     }
-    if let Some(id) = r.turns.lock().await.get(native).cloned() {
+    if let Some(id) = r
+        .threads
+        .lock()
+        .await
+        .get(native)
+        .and_then(|thread| thread.turn.clone())
+    {
         return Ok(Some(id));
     }
     let page = r
@@ -920,7 +1021,12 @@ async fn current_turn(r: &Runtime, native: &str) -> Result<Option<String>> {
         "Active turn is being synchronized; retry the message shortly"
     );
     if let Some(id) = &id {
-        r.turns.lock().await.insert(native.into(), id.clone());
+        r.threads
+            .lock()
+            .await
+            .entry(native.into())
+            .or_default()
+            .turn = Some(id.clone());
     }
     Ok(id)
 }
@@ -945,20 +1051,18 @@ async fn supervise(r: Arc<Runtime>) {
 async fn stop(r: &Runtime) {
     r.rpc.close();
     let mut process = r.child.lock().await;
-    if let Some(pid) = process.child.id() {
+    if let Some(group) = process.group.take() {
         unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+            libc::kill(-group, libc::SIGTERM);
         }
-        if tokio::time::timeout(std::time::Duration::from_secs(3), process.child.wait())
-            .await
-            .is_err()
-        {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
-            let _ = process.child.wait().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), process.child.wait()).await;
+        // Also reap tool processes that outlived the app-server's leader.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
         }
+        let _ = process.child.wait().await;
     }
+    let _ = std::fs::remove_dir_all(&process.dir);
 }
 async fn emit(store: &Store, events: &broadcast::Sender<AgentEvent>, e: AgentEvent) -> Result<()> {
     store.event(&e).await?;
@@ -997,7 +1101,12 @@ async fn finish(
 ) -> Result<()> {
     let request = r.requests.lock().await.remove(id);
     if let Some(request) = request
-        && let Some(s) = r.sessions.lock().await.get(&request.thread).cloned()
+        && let Some(s) = r
+            .threads
+            .lock()
+            .await
+            .get(&request.thread)
+            .and_then(|thread| thread.session.clone())
     {
         store.resolve(id).await?;
         emit(
@@ -1223,6 +1332,56 @@ fn item_event(s: &Session, item: &Value, complete: bool) -> Option<AgentEvent> {
         origin: origin.map(str::to_owned),
     })
 }
+// Publication is triggered by live messages, independently of how the thread
+// was created or resumed. Persisted binding receipts preserve explicit unbinds.
+async fn observe_message_session(
+    r: &Arc<Runtime>,
+    store: &Store,
+    events: &broadcast::Sender<AgentEvent>,
+    native: &str,
+) -> Result<Option<Session>> {
+    let cached = r
+        .threads
+        .lock()
+        .await
+        .get(native)
+        .and_then(|thread| thread.session.clone());
+    let existing = match &cached {
+        Some(session) => Some(session.clone()),
+        None => store.native_session(&r.agent, native).await?,
+    };
+    if let Some(session) = &existing
+        && store.was_bound(&session.id).await?
+    {
+        if cached.is_some() {
+            return Ok(existing);
+        }
+        if store.targets(&session.id).await?.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(attach(r, store, native).await?));
+    }
+    let thread = r
+        .rpc
+        .request(
+            "thread/read",
+            json!({"threadId":native,"includeTurns":false}),
+        )
+        .await?;
+    let Some(info) = summary(&thread["thread"]) else {
+        return Ok(None);
+    };
+    if r.config.project_for_cwd(&r.agent, &info.cwd).is_err() {
+        return Ok(None);
+    }
+    let session = attach(r, store, native).await?;
+    if let Some(thread) = r.threads.lock().await.get_mut(native) {
+        thread.draft_directory = None;
+    }
+    announce(store, events, &session).await?;
+    Ok(Some(session))
+}
+
 async fn observe(
     r: Arc<Runtime>,
     store: Store,
@@ -1234,10 +1393,18 @@ async fn observe(
     loop {
         let v = tokio::select! {_=r.cancel.cancelled()=>break,v=notices.recv()=>match v {Ok(v)=>v,Err(broadcast::error::RecvError::Lagged(n))=>{tracing::error!(n,"Agent stream lagged; reconcile using history");continue;},Err(_)=>break}};
         if v["method"] == "uaoi/disconnected" {
-            r.subscriptions.lock().await.clear();
-            r.starting.lock().await.clear();
-            r.turns.lock().await.clear();
-            let sessions: Vec<_> = r.sessions.lock().await.values().cloned().collect();
+            let sessions: Vec<_> = {
+                let mut threads = r.threads.lock().await;
+                for thread in threads.values_mut() {
+                    thread.subscribed = false;
+                    thread.starting = false;
+                    thread.turn = None;
+                }
+                threads
+                    .values()
+                    .filter_map(|thread| thread.session.clone())
+                    .collect()
+            };
             for s in sessions {
                 let _ = invalidate(&r, &store, &events, &s.native, None).await;
             }
@@ -1250,14 +1417,17 @@ async fn observe(
                 .as_str()
                 .or_else(|| p["thread"]["id"].as_str())
                 .unwrap_or("");
-            if matches!(method, "thread/closed" | "thread/archived") {
-                r.pending_bindings.lock().await.remove(native);
+            if matches!(method, "thread/closed" | "thread/archived")
+                && let Some(thread) = r.threads.lock().await.get_mut(native)
+            {
+                thread.draft_directory = None;
             }
             if matches!(
                 method,
                 "turn/started" | "turn/completed" | "thread/closed" | "thread/archived"
-            ) {
-                r.starting.lock().await.remove(native);
+            ) && let Some(thread) = r.threads.lock().await.get_mut(native)
+            {
+                thread.starting = false;
             }
             if method == "thread/name/updated" {
                 if let Some(s) = store.native_session(&r.agent, native).await? {
@@ -1266,32 +1436,40 @@ async fn observe(
                 return Ok(());
             }
             if method == "thread/settings/updated" {
-                r.modes.lock().await.insert(
-                    native.into(),
-                    p["threadSettings"]["collaborationMode"].clone(),
-                );
+                r.threads
+                    .lock()
+                    .await
+                    .entry(native.into())
+                    .or_default()
+                    .mode = Some(p["threadSettings"]["collaborationMode"].clone());
                 return Ok(());
             }
-            let begins_work = method == "turn/started"
-                || (["item/started", "item/completed"].contains(&method)
-                    && p["item"]["type"] == "userMessage");
-            let known = r.sessions.lock().await.contains_key(native);
-            if begins_work && !known {
-                let pending = r.pending_bindings.lock().await.contains_key(native);
-                let bound = if let Some(s) = store.native_session(&r.agent, native).await? {
-                    !store.targets(&s.id).await?.is_empty()
-                } else {
-                    false
-                };
-                if !pending && !bound {
-                    return Ok(());
-                }
-                let s = attach(&r, &store, native).await?;
-                if r.pending_bindings.lock().await.remove(native).is_some() {
-                    announce(&store, &events, &s).await?;
-                }
+            let known = r
+                .threads
+                .lock()
+                .await
+                .get(native)
+                .is_some_and(|thread| thread.session.is_some());
+            let message = (["item/started", "item/completed"].contains(&method)
+                && ["userMessage", "agentMessage"]
+                    .contains(&p["item"]["type"].as_str().unwrap_or("")))
+                || (!known
+                    && method == "item/agentMessage/delta"
+                    && p["delta"].as_str().is_some_and(|text| !text.is_empty()));
+            if message
+                && observe_message_session(&r, &store, &events, native)
+                    .await?
+                    .is_none()
+            {
+                return Ok(());
             }
-            let Some(s) = r.sessions.lock().await.get(native).cloned() else {
+            let Some(s) = r
+                .threads
+                .lock()
+                .await
+                .get(native)
+                .and_then(|thread| thread.session.clone())
+            else {
                 return Ok(());
             };
             match method {
@@ -1300,10 +1478,12 @@ async fn observe(
                 }
                 "thread/closed" | "thread/archived" => {
                     invalidate(&r, &store, &events, native, None).await?;
-                    r.sessions.lock().await.remove(native);
-                    r.subscriptions.lock().await.remove(native);
-                    r.starting.lock().await.remove(native);
-                    r.turns.lock().await.remove(native);
+                    if let Some(thread) = r.threads.lock().await.get_mut(native) {
+                        thread.session = None;
+                        thread.subscribed = false;
+                        thread.starting = false;
+                        thread.turn = None;
+                    }
                     emit(
                         &store,
                         &events,
@@ -1320,11 +1500,15 @@ async fn observe(
                     .await?;
                 }
                 "turn/started" => {
-                    r.starting.lock().await.remove(native);
-                    if let Some(id) = p["turn"]["id"].as_str() {
-                        r.turns.lock().await.insert(native.into(), id.into());
+                    {
+                        let mut threads = r.threads.lock().await;
+                        let thread = threads.entry(native.into()).or_default();
+                        thread.starting = false;
+                        if let Some(id) = p["turn"]["id"].as_str() {
+                            thread.turn = Some(id.into());
+                        }
+                        thread.plan = None;
                     }
-                    r.plans.lock().await.remove(native);
                     invalidate(&r, &store, &events, native, Some(RequestKind::Plan)).await?;
                 }
                 "serverRequest/resolved" => {
@@ -1387,17 +1571,21 @@ async fn observe(
                 let item = &p["item"];
                 let complete = method == "item/completed";
                 if item["type"] == "userMessage" {
-                    r.plans.lock().await.remove(native);
+                    if let Some(thread) = r.threads.lock().await.get_mut(native) {
+                        thread.plan = None;
+                    }
                     invalidate(&r, &store, &events, native, Some(RequestKind::Plan)).await?;
                 }
                 if complete && item["type"] == "plan" {
-                    r.plans.lock().await.insert(
-                        native.into(),
-                        (
-                            p["turnId"].as_str().unwrap_or("").into(),
-                            item["text"].as_str().unwrap_or("").into(),
-                        ),
-                    );
+                    r.threads
+                        .lock()
+                        .await
+                        .entry(native.into())
+                        .or_default()
+                        .plan = Some((
+                        p["turnId"].as_str().unwrap_or("").into(),
+                        item["text"].as_str().unwrap_or("").into(),
+                    ));
                 }
                 if item["type"] == "agentMessage" && item["questions"].is_array() {
                     // The question card replaces this item's text projection.
@@ -1475,8 +1663,14 @@ async fn observe(
                     origin: None,
                 });
             } else if method == "turn/completed" {
-                r.starting.lock().await.remove(native);
-                r.turns.lock().await.remove(native);
+                let plan = {
+                    let mut threads = r.threads.lock().await;
+                    threads.get_mut(native).and_then(|thread| {
+                        thread.starting = false;
+                        thread.turn = None;
+                        thread.plan.take()
+                    })
+                };
                 event = Some(AgentEvent {
                     session: s.id.clone(),
                     key: format!("turn:{}", p["turn"]["id"]),
@@ -1498,16 +1692,16 @@ async fn observe(
                     request: None,
                     origin: None,
                 });
-                let plan = r.plans.lock().await.remove(native);
                 if let Some((turn, text)) = plan
                     && p["turn"]["status"] == "completed"
                     && p["turn"]["id"] == turn
                     && !text.trim().is_empty()
-                    && r.modes
+                    && r.threads
                         .lock()
                         .await
                         .get(native)
-                        .is_some_and(|m| m["mode"] == "plan")
+                        .and_then(|thread| thread.mode.as_ref())
+                        .is_some_and(|mode| mode["mode"] == "plan")
                 {
                     let view = PendingRequest {
                         id: uuid::Uuid::new_v4().simple().to_string(),
@@ -1551,169 +1745,15 @@ async fn observe(
             tracing::warn!(%error,"Native event processing failed");
         }
     }
-    for s in r.sessions.lock().await.values() {
-        let _ = store.expire_requests(&s.id).await;
+    let sessions: Vec<_> = r
+        .threads
+        .lock()
+        .await
+        .values()
+        .filter_map(|thread| thread.session.clone())
+        .collect();
+    for session in sessions {
+        let _ = store.expire_requests(&session.id).await;
     }
     stop(&r).await;
-}
-async fn validate_creation(
-    r: &Runtime,
-    method: &str,
-    params: &mut Value,
-    fallback: &Path,
-) -> Result<()> {
-    let native = params["threadId"].as_str().unwrap_or("");
-    let pending_turn =
-        method == "turn/start" && r.pending_bindings.lock().await.contains_key(native);
-    if !matches!(method, "thread/start" | "thread/fork") && !pending_turn {
-        return Ok(());
-    }
-    if !params["threadSource"].is_null() && params["threadSource"] != "user" {
-        return Ok(());
-    }
-    let cwd = if let Some(path) = params["cwd"].as_str() {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            path.to_owned()
-        } else {
-            fallback.join(path)
-        }
-    } else if pending_turn {
-        r.pending_bindings
-            .lock()
-            .await
-            .get(native)
-            .cloned()
-            .context("New session directory unavailable")?
-    } else if !native.is_empty() {
-        let thread = r
-            .rpc
-            .request(
-                "thread/read",
-                json!({"threadId":native,"includeTurns":false}),
-            )
-            .await?;
-        PathBuf::from(
-            thread["thread"]["cwd"]
-                .as_str()
-                .context("Session working directory unavailable")?,
-        )
-    } else {
-        fallback.to_owned()
-    };
-    let (_, project) = r.config.project_for_cwd(&r.agent, &cwd)?;
-    params["cwd"] = json!(project.cwd);
-    Ok(())
-}
-async fn gateway(
-    io: tokio::net::UnixStream,
-    r: Arc<Runtime>,
-    store: Store,
-    events: broadcast::Sender<AgentEvent>,
-    cancel: CancellationToken,
-    permissions: codex_cli::Permissions,
-    cwd: PathBuf,
-) -> Result<()> {
-    let down = tokio_tungstenite::accept_async_with_config(io, Some(rpc::limits())).await?;
-    let up = rpc::connect(&r.engine).await?;
-    let (mut ds, mut dr) = down.split();
-    let (mut us, mut ur) = up.split();
-    let mut lifecycle: HashMap<String, String> = HashMap::new();
-    let mut owned_threads: HashSet<String> = HashSet::new();
-    let mut questions: HashMap<String, (String, Value)> = HashMap::new();
-    let mut starts: HashMap<String, String> = HashMap::new();
-    loop {
-        tokio::select! {
-            _=cancel.cancelled()=>break,
-            m=dr.next()=>match m {
-                Some(Ok(Message::Text(t)))=>{
-                    let mut v:Value=serde_json::from_str(&t)?;
-                    let method=v["method"].as_str().unwrap_or("").to_owned();
-                    if let Err(error) = validate_creation(&r, &method, &mut v["params"], &cwd).await {
-                        ds.send(Message::Text(json!({"id":v["id"],"error":{"code":-32602,"message":error.to_string()}}).to_string().into())).await?;
-                        continue;
-                    }
-                    if method=="turn/start" && let Some(native)=v["params"]["threadId"].as_str() {
-                        r.starting.lock().await.insert(native.into());starts.insert(v["id"].to_string(),native.into());
-                    }
-                    if ["thread/start","thread/resume","thread/fork"].contains(&method.as_str()) {
-                        lifecycle.insert(v["id"].to_string(),method.clone());
-                        if v["params"]["threadSource"].is_null() || v["params"]["threadSource"]=="user" {
-                            permissions.apply(&mut v["params"]);
-                        }
-                    }
-                    if method.is_empty() && let Some((method,p))=questions.remove(&v["id"].to_string()) {
-                        if !r.answered.lock().await.insert(v["id"].to_string()) {continue;}
-                        let session=r.sessions.lock().await.get(p["threadId"].as_str().unwrap_or("")).cloned();
-                        if let Some(s)=session {
-                            let view=native_question(&method,&p,String::new());
-                            let text=format!("Answer submitted via CLI\n{}",answer_text(&view,&v["result"]));
-                            let id=r.requests.lock().await.iter().find(|(_,q)|q.wire_id.as_ref()==Some(&v["id"])).map(|(id,_)|id.clone());
-                            if let Some(id)=id{finish(&r,&store,&events,&id,&text).await?;}else{emit(&store,&events,AgentEvent{session:s.id,key:format!("answer:{}",v["id"]),kind:EventKind::Status,text,complete:true,request:None,origin:None}).await?;}
-                        }
-                    }
-                    us.send(Message::Text(v.to_string().into())).await?;
-                },Some(Ok(Message::Ping(b)))=>{ds.send(Message::Pong(b)).await?;},Some(Ok(Message::Close(_)))|None=>break,Some(Err(e))=>return Err(e.into()),_=>{},
-            },
-            m=ur.next()=>match m {
-                Some(Ok(Message::Text(t)))=>{
-                    let v:Value=serde_json::from_str(&t)?;
-                    if v.get("method").is_none() && let Some(native)=starts.remove(&v["id"].to_string()) && v.get("error").is_some() {r.starting.lock().await.remove(&native);}
-                    if v.get("method").is_none() && let Some(method)=lifecycle.remove(&v["id"].to_string()) && v.get("error").is_none() && human_thread(&v["result"]["thread"]) && let Some(native)=v["result"]["thread"]["id"].as_str() {
-                        let created=method!="thread/resume";
-                        if created {r.pending_bindings.lock().await.insert(native.into(),PathBuf::from(v["result"]["thread"]["cwd"].as_str().context("Missing new session cwd")?));owned_threads.insert(native.into());}
-                        let bound=if let Some(s)=store.native_session(&r.agent,native).await? { !store.targets(&s.id).await?.is_empty() } else {false};
-                        if bound || (created && has_user_turn(&r,&v["result"]["thread"]).await.unwrap_or(false)) {
-                            let s=attach(&r,&store,native).await?;
-                            if r.pending_bindings.lock().await.remove(native).is_some() {announce(&store,&events,&s).await?;}
-                        }
-                        remember_mode(&r,native,&v["result"]).await;
-                    }
-                    if let Some(method)=v["method"].as_str() && v.get("id").is_some() && ["item/tool/requestUserInput","item/commandExecution/requestApproval","item/fileChange/requestApproval"].contains(&method) {
-                        questions.insert(v["id"].to_string(),(method.into(),v["params"].clone()));
-                    }
-                    let native=v["params"]["threadId"].as_str().or_else(||v["params"]["thread"]["id"].as_str()).unwrap_or("");
-                    if v.get("method").is_some() && !native.is_empty() && !r.subscriptions.lock().await.contains(native) {
-                        let _=r.rpc.notices.send(v.clone());
-                    }
-                    if ds.send(Message::Text(t)).await.is_err(){break;}
-                },Some(Ok(Message::Ping(b)))=>{us.send(Message::Pong(b)).await?;},Some(Ok(Message::Close(_)))|None=>break,Some(Err(e))=>return Err(e.into()),_=>{},
-            }
-        }
-    }
-    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-    loop {
-        let subscribed = r.subscriptions.lock().await;
-        let sessions = r.sessions.lock().await;
-        owned_threads.retain(|id| {
-            !subscribed.contains(id)
-                && (sessions.contains_key(id)
-                    || r.starting
-                        .try_lock()
-                        .is_ok_and(|starting| starting.contains(id)))
-        });
-        drop(sessions);
-        drop(subscribed);
-        if owned_threads.is_empty() {
-            break;
-        }
-        // A blank thread has no rollout and cannot be resumed onto the control
-        // connection yet. Retain its original subscription after the TUI exits.
-        tokio::select! {
-            _=r.cancel.cancelled()=>break,
-            _=tick.tick()=>{},
-            message=ur.next()=>match message {
-                Some(Ok(Message::Text(t)))=>{
-                    if let Ok(v)=serde_json::from_str::<Value>(&t) {
-                        let native=v["params"]["threadId"].as_str().or_else(||v["params"]["thread"]["id"].as_str()).unwrap_or("");
-                        if owned_threads.contains(native) && !r.subscriptions.lock().await.contains(native) {let _=r.rpc.notices.send(v);}
-                    }
-                },
-                Some(Ok(Message::Ping(b)))=>{if us.send(Message::Pong(b)).await.is_err(){break;}},
-                Some(Ok(Message::Close(_)))|Some(Err(_))|None=>break,
-                _=>{},
-            }
-        }
-    }
-    Ok(())
 }

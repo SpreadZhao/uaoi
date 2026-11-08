@@ -19,10 +19,10 @@ impl Store {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         anyhow::ensure!(
-            (tables == 0 && version == 0) || version == 5,
+            (tables == 0 && version == 0) || version == 6,
             "Unsupported uaoi database. Use a fresh state directory; old state cannot be loaded."
         );
-        conn.pragma_update(None, "user_version", 5)?;
+        conn.pragma_update(None, "user_version", 6)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -40,8 +40,9 @@ impl Store {
           CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, target TEXT NOT NULL, body TEXT NOT NULL);
 ")?;
         conn.execute("DELETE FROM actions", [])?;
-        // Requests belong to a live CLI connection and never survive a service restart.
+        // Interactive controls belong to a runtime generation, not persisted history.
         conn.execute("UPDATE requests SET resolved=1", [])?;
+        conn.execute("UPDATE deliveries SET buttons='[]',text=text || '\nExpired',state=CASE WHEN state='sent' THEN 'pending' ELSE state END WHERE buttons<>'[]'", [])?;
         // An interrupted send without a platform receipt has an unknown outcome.
         conn.execute("UPDATE deliveries SET state=CASE WHEN message IS NULL THEN 'unknown' ELSE 'pending' END WHERE state='sending'", [])?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
@@ -116,14 +117,7 @@ impl Store {
                 [&s],
                 row_session,
             )?;
-            let name: Option<String> = tx
-                .query_row(
-                    "SELECT title FROM session_titles WHERE session=?1",
-                    [&s],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            queue_title(&tx, &t, &display_title(&session, name.as_deref()))?;
+            record_binding(&tx, &t, &session)?;
             if inserted != 0 {
                 tx.execute(
                     "UPDATE binding_state SET revision=revision+1 WHERE id=1",
@@ -138,6 +132,15 @@ impl Store {
     pub async fn bound(&self, target: &Conversation) -> Result<Option<Session>> {
         let t = target.clone();
         self.call(move|db|Ok(db.query_row("SELECT s.id,s.agent,s.native FROM sessions s JOIN bindings b ON b.session=s.id WHERE platform=?1 AND space=?2 AND thread=?3",params![t.platform,t.space,t.thread],row_session).optional()?)).await
+    }
+    pub async fn was_bound(&self, session: &str) -> Result<bool> {
+        let session = session.to_owned();
+        self.call(move |db| {
+            Ok(db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bindings WHERE session=?1) OR EXISTS(SELECT 1 FROM operations WHERE id=?2 AND state='accepted')",
+                params![session, format!("binding-history:{session}")], |r| r.get(0),
+            )?)
+        }).await
     }
     pub async fn targets(&self, session: &str) -> Result<Vec<Conversation>> {
         let s = session.to_owned();
@@ -163,6 +166,13 @@ impl Store {
             Ok((revision,records))
         }).await
     }
+    pub async fn bindings_in_space(&self, target: &Conversation) -> Result<Vec<BindingRecord>> {
+        let (platform, space) = (target.platform.clone(), target.space.clone());
+        self.call(move |db| {
+            Ok(db.prepare("SELECT s.id,s.agent,s.native,b.platform,b.space,b.thread FROM bindings b JOIN sessions s ON s.id=b.session WHERE b.platform=?1 AND b.space=?2 ORDER BY s.agent,s.native")?
+                .query_map(params![platform, space], |r| Ok(BindingRecord { session:row_session(r)?, target:Conversation { platform:r.get(3)?,space:r.get(4)?,thread:r.get(5)? } }))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        }).await
+    }
     pub async fn replace_bindings(&self, revision: u64, records: Vec<BindingRecord>) -> Result<()> {
         self.call(move |db| {
             let tx = db.transaction()?;
@@ -177,12 +187,12 @@ impl Store {
                 tx.execute("DELETE FROM actions WHERE target=?1", [serde_json::to_string(&t)?])?;
                 tx.execute("DELETE FROM conversation_titles WHERE platform=?1 AND space=?2 AND thread=?3", params![t.platform,t.space,t.thread])?;
             }
+            tx.execute("INSERT OR IGNORE INTO operations(id,state,detail) SELECT 'binding-history:' || session,'accepted','' FROM bindings", [])?;
             tx.execute("DELETE FROM bindings", [])?;
             for record in records {
                 let t=&record.target;
                 tx.execute("INSERT INTO bindings VALUES(?1,?2,?3,?4)", params![t.platform,t.space,t.thread,record.session.id])?;
-                let title: Option<String> = tx.query_row("SELECT title FROM session_titles WHERE session=?1", [&record.session.id], |r| r.get(0)).optional()?;
-                queue_title(&tx,t,&display_title(&record.session,title.as_deref()))?;
+                record_binding(&tx, t, &record.session)?;
             }
             tx.execute("UPDATE binding_state SET revision=revision+1 WHERE id=1", [])?;
             tx.commit()?;
@@ -227,8 +237,16 @@ impl Store {
             tx.commit()?;Ok(())
         }).await
     }
+    #[cfg(test)]
     pub async fn pending_titles(&self) -> Result<Vec<TitleChange>> {
-        self.call(|db|Ok(db.prepare("SELECT c.platform,c.space,c.thread,c.desired,s.agent FROM conversation_titles c JOIN bindings b USING(platform,space,thread) JOIN sessions s ON s.id=b.session WHERE (c.applied IS NULL OR c.applied<>c.desired) AND c.next_attempt<=unixepoch() ORDER BY c.rowid LIMIT 25")?.query_map([],|r|Ok(TitleChange{agent:r.get(4)?,target:Conversation{platform:r.get(0)?,space:r.get(1)?,thread:r.get(2)?},title:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?)).await
+        self.pending_titles_for(None).await
+    }
+    pub async fn pending_titles_for(
+        &self,
+        agents: Option<Vec<String>>,
+    ) -> Result<Vec<TitleChange>> {
+        let agents = agents.map(|a| serde_json::to_string(&a).unwrap());
+        self.call(move |db|Ok(db.prepare("SELECT c.platform,c.space,c.thread,c.desired,s.agent FROM conversation_titles c JOIN bindings b USING(platform,space,thread) JOIN sessions s ON s.id=b.session WHERE (c.applied IS NULL OR c.applied<>c.desired) AND c.next_attempt<=unixepoch() AND (?1 IS NULL OR s.agent IN (SELECT value FROM json_each(?1))) ORDER BY c.rowid LIMIT 25")?.query_map([agents],|r|Ok(TitleChange{agent:r.get(4)?,target:Conversation{platform:r.get(0)?,space:r.get(1)?,thread:r.get(2)?},title:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?)).await
     }
     pub async fn title_is_current(&self, change: &TitleChange) -> Result<bool> {
         let c = change.clone();
@@ -383,6 +401,20 @@ impl Store {
             Ok(())
         }).await
     }
+    pub async fn expire_profile(&self, agent: &str) -> Result<Vec<String>> {
+        let agent = agent.to_owned();
+        self.call(move |db| {
+            let tx = db.transaction()?;
+            let ids = tx.prepare("SELECT requests.id FROM requests JOIN sessions ON sessions.id=requests.session WHERE sessions.agent=?1 AND resolved=0")?
+                .query_map([&agent], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            tx.execute("UPDATE requests SET resolved=1 WHERE session IN (SELECT id FROM sessions WHERE agent=?1)", [&agent])?;
+            tx.execute("DELETE FROM actions WHERE json_extract(body,'$.session') IN (SELECT id FROM sessions WHERE agent=?1) OR json_extract(body,'$.request') IN (SELECT requests.id FROM requests JOIN sessions ON sessions.id=requests.session WHERE sessions.agent=?1)", [&agent])?;
+            tx.execute("UPDATE deliveries SET buttons='[]',text=text || '\nExpired',state=CASE WHEN state='sent' THEN 'pending' ELSE state END WHERE agent=?1 AND buttons<>'[]'", [&agent])?;
+            tx.execute("UPDATE deliveries SET state=CASE WHEN message IS NULL THEN 'unknown' ELSE 'pending' END WHERE agent=?1 AND state='sending'", [&agent])?;
+            tx.commit()?;
+            Ok(ids)
+        }).await
+    }
     pub async fn history(
         &self,
         session: &str,
@@ -415,10 +447,15 @@ impl Store {
             Ok(())
         }).await
     }
+    #[cfg(test)]
     pub async fn pending(&self) -> Result<Vec<Delivery>> {
-        self.call(|db| {
-            let mut stmt=db.prepare("SELECT id,platform,space,thread,text,message,buttons,key,links,agent FROM deliveries WHERE state='pending' ORDER BY id LIMIT 25")?;
-            let rows=stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?,Conversation{platform:r.get(1)?,space:r.get(2)?,thread:r.get(3)?},r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        self.pending_for(None).await
+    }
+    pub async fn pending_for(&self, agents: Option<Vec<String>>) -> Result<Vec<Delivery>> {
+        let agents = agents.map(|a| serde_json::to_string(&a).unwrap());
+        self.call(move |db| {
+            let mut stmt=db.prepare("SELECT id,platform,space,thread,text,message,buttons,key,links,agent FROM deliveries WHERE state='pending' AND (?1 IS NULL OR agent IN (SELECT value FROM json_each(?1))) ORDER BY id LIMIT 25")?;
+            let rows=stmt.query_map([agents], |r| Ok((r.get::<_,i64>(0)?,Conversation{platform:r.get(1)?,space:r.get(2)?,thread:r.get(3)?},r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,String>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
             rows.into_iter().map(|(id,target,text,message,buttons,key,links,agent)| Ok(Delivery{agent,id,key,target,text,message,buttons:serde_json::from_str(&buttons)?,links:serde_json::from_str(&links)?})).collect()
         }).await
     }
@@ -496,6 +533,21 @@ fn display_title(session: &Session, name: Option<&str>) -> String {
                 session.native.chars().take(8).collect::<String>()
             )
         })
+}
+// The caller's transaction owns the binding, its history receipt, and title.
+fn record_binding(db: &Connection, target: &Conversation, session: &Session) -> Result<()> {
+    db.execute(
+        "INSERT OR IGNORE INTO operations(id,state,detail) VALUES(?1,'accepted','')",
+        [format!("binding-history:{}", session.id)],
+    )?;
+    let name: Option<String> = db
+        .query_row(
+            "SELECT title FROM session_titles WHERE session=?1",
+            [&session.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    queue_title(db, target, &display_title(session, name.as_deref()))
 }
 fn queue_title(db: &Connection, target: &Conversation, title: &str) -> Result<()> {
     db.execute("INSERT INTO conversation_titles(platform,space,thread,desired) VALUES(?1,?2,?3,?4) ON CONFLICT(platform,space,thread) DO UPDATE SET desired=excluded.desired,next_attempt=CASE WHEN desired<>excluded.desired THEN 0 ELSE next_attempt END",params![target.platform,target.space,target.thread,title])?;

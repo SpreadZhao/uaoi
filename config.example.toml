@@ -1,17 +1,20 @@
-# Version 3 requires fresh state. Older configuration and state are rejected.
-version = 3
-# state_dir = "/home/you/.local/state/uaoi-v3"
+# Version 4 requires fresh state. Older configuration and state are rejected.
+version = 4
+# state_dir = "/home/you/.local/state/uaoi-v4"
 # runtime_dir = "/run/user/1000/uaoi"
 
 # Each agent has a distinct Bot and native profile/server.
-# Every CLI invocation selects its agent explicitly with --agent NAME.
+# Launch with uaoi --agent NAME; put native CLI arguments after --.
+# Only agents with an open CLI have a running Bot and app-server.
 [agents.work]
 kind = "codex"
 command = ["/absolute/path/to/codex-work"]
 output = "compact" # compact or verbose; configuration only
 # env = { CODEX_HOME = "/home/you/.codex-work" }
 [agents.work.telegram]
-token_env = "UAOI_WORK_BOT_TOKEN"
+token = "YOUR_WORK_BOT_TOKEN"
+# Alternatively, replace token with:
+# token_env = "UAOI_WORK_BOT_TOKEN"
 
 [agents.personal]
 kind = "codex"
@@ -19,16 +22,18 @@ command = ["/absolute/path/to/codex-personal"]
 output = "compact"
 # env = { CODEX_HOME = "/home/you/.codex-personal" }
 [agents.personal.telegram]
-token_env = "UAOI_PERSONAL_BOT_TOKEN"
+token = "YOUR_PERSONAL_BOT_TOKEN"
+# Alternatively, replace token with:
+# token_env = "UAOI_PERSONAL_BOT_TOKEN"
 
 # Create forum groups manually, add the listed Bots, and grant Manage Topics.
 # cwd must be an existing absolute directory; matching uses its canonical path.
+# Telegram /new always uses the directory of the current group's project.
 [projects.uaoi]
 cwd = "/home/you/workspaces/uaoi"
 agents = ["work", "personal"]
 [projects.uaoi.telegram]
 group = -1001234567890
-allowed_users = [123456789]
 
 # Agents can share their server across several projects.
 [projects.website]
@@ -36,4 +41,3 @@ cwd = "/home/you/workspaces/website"
 agents = ["work"]
 [projects.website.telegram]
 group = -1009876543210
-allowed_users = [123456789]

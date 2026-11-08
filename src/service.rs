@@ -1,34 +1,37 @@
+mod interaction;
+mod output;
+use interaction::QuestionDraft;
+use output::Message;
+#[cfg(test)]
+pub(crate) use output::split_output;
+
 use crate::{
     agent::AgentAdapter,
-    config::{Config, OutputMode},
+    config::Config,
     im::{ImAdapter, SendFailure},
     model::*,
     store::Store,
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 const MANAGEMENT_COMMANDS: &[(&str, &str, &str)] = &[
-    ("agents", "/agents [running|text]", "Query bound sessions"),
     (
-        "new",
-        "/new <absolute directory>",
-        "Create a session and its topic",
+        "agents",
+        "/agents [running|text]",
+        "List this project's bound sessions",
     ),
-];
-const TASK_COMMANDS: &[(&str, &str, &str)] = &[
+    ("new", "/new", "Create a session in this project"),
     (
         "status",
         "/status",
-        "Show session, directory, mode, and state",
+        "Show project or current-session status",
     ),
+];
+const TASK_COMMANDS: &[(&str, &str, &str)] = &[
     (
         "plan",
         "/plan [task]",
@@ -39,7 +42,7 @@ const TASK_COMMANDS: &[(&str, &str, &str)] = &[
         "/default [task]",
         "Select Default mode, optionally starting a task",
     ),
-    ("stop", "/stop", "Interrupt the current task"),
+    ("stop", "/stop", "Interrupt this session's task"),
     ("history", "/history [offset]", "Read earlier messages"),
 ];
 
@@ -52,13 +55,6 @@ pub struct Service {
     started: u64,
     drafts: Mutex<HashMap<String, QuestionDraft>>,
     binding_gate: Mutex<()>,
-}
-#[derive(Clone, Default)]
-struct QuestionDraft {
-    current: usize,
-    review: bool,
-    submitting: bool,
-    answers: BTreeMap<String, String>,
 }
 impl Service {
     pub fn new(
@@ -81,100 +77,26 @@ impl Service {
                 .as_secs(),
         }
     }
-    fn im(&self, name: &str) -> Result<&Arc<dyn ImAdapter>> {
+    fn active_agents(&self) -> Vec<String> {
+        self.ims
+            .iter()
+            .filter(|im| im.enabled())
+            .map(|im| im.agent().to_owned())
+            .collect()
+    }
+    pub(crate) fn im(&self, name: &str) -> Result<&Arc<dyn ImAdapter>> {
         self.ims
             .iter()
             .find(|i| i.agent() == name)
             .context("IM adapter unavailable")
     }
-    pub async fn notice(&self, target: &Conversation, key: &str, text: &str) -> Result<()> {
-        self.output(target, key, text, vec![]).await
-    }
-    async fn output(
-        &self,
-        target: &Conversation,
-        key: &str,
-        text: &str,
-        buttons: Vec<(String, String)>,
-    ) -> Result<()> {
-        self.output_rows(
-            target,
-            key,
-            text,
-            buttons.into_iter().map(|button| vec![button]).collect(),
-        )
-        .await
-    }
-    async fn output_rows(
-        &self,
-        target: &Conversation,
-        key: &str,
-        text: &str,
-        buttons: Vec<ButtonRow>,
-    ) -> Result<()> {
-        self.output_linked(target, key, text, buttons, vec![]).await
-    }
-    async fn output_linked(
-        &self,
-        target: &Conversation,
-        key: &str,
-        text: &str,
-        buttons: Vec<ButtonRow>,
-        links: Vec<TextLink>,
-    ) -> Result<()> {
-        let agent = if let Some(session) = self.store.bound(target).await? {
-            session.agent
-        } else {
-            let project = self.project_name(target)?;
-            self.cfg.projects[project].agents[0].clone()
-        };
-        self.output_linked_as(&agent, target, key, text, buttons, links)
-            .await
-    }
-    async fn notice_as(
-        &self,
-        agent: &str,
-        target: &Conversation,
-        key: &str,
-        text: &str,
-    ) -> Result<()> {
-        self.output_linked_as(agent, target, key, text, vec![], vec![])
-            .await
-    }
-    async fn output_linked_as(
-        &self,
-        agent: &str,
-        target: &Conversation,
-        key: &str,
-        text: &str,
-        buttons: Vec<ButtonRow>,
-        links: Vec<TextLink>,
-    ) -> Result<()> {
-        let chunks = split_output(text);
-        let mut offset = 0;
-        for (i, part) in chunks.into_iter().enumerate() {
-            let end = offset + part.len();
-            let part_links = links
-                .iter()
-                .filter(|link| link.start >= offset && link.end <= end)
-                .map(|link| TextLink {
-                    start: link.start - offset,
-                    end: link.end - offset,
-                    url: link.url.clone(),
-                })
-                .collect();
-            self.store
-                .enqueue(
-                    agent,
-                    target,
-                    &format!("{key}:{i}"),
-                    &part,
-                    if i == 0 { buttons.clone() } else { vec![] },
-                    part_links,
-                )
-                .await?;
-            offset = end;
+    pub(crate) async fn expire_profile(&self, name: &str) -> Result<()> {
+        let ids = self.store.expire_profile(name).await?;
+        let mut drafts = self.drafts.lock().await;
+        for id in ids {
+            drafts.remove(&id);
         }
+        drop(drafts);
         Ok(())
     }
     async fn route_lock(&self, t: &Conversation) -> Arc<Mutex<()>> {
@@ -187,12 +109,12 @@ impl Service {
     }
     pub async fn handle(&self, msg: Inbound) -> Result<()> {
         let im = self.im(&msg.agent)?;
-        if !im.authorized(&msg.sender, &msg.target) || msg.sent_at < self.started {
+        if !im.enabled() || msg.sent_at < self.started.max(im.started()) {
             return Ok(());
         }
-        let project = im
-            .project(&msg.target)
-            .context("Group is not configured for this Bot")?;
+        let Some(project) = im.project(&msg.target) else {
+            return Ok(());
+        };
         let lock = self.route_lock(&msg.target).await;
         let _guard = lock.lock().await;
         let command = msg
@@ -211,8 +133,9 @@ impl Service {
             Some(session) => session.agent.as_str(),
             None => self.cfg.projects[project]
                 .agents
-                .first()
-                .context("Project has no agents")?
+                .iter()
+                .find(|name| self.im(name).is_ok_and(|im| im.enabled()))
+                .context("Project has no active agents")?
                 .as_str(),
         };
         if !msg.addressed && owner != msg.agent {
@@ -244,11 +167,14 @@ impl Service {
                     )
                     .await?;
                 if msg.action.is_none() {
-                    self.notice_as(
+                    self.output_as(
                         &msg.agent,
                         &msg.target,
                         &format!("error:{}", msg.id),
-                        &e.to_string(),
+                        Message {
+                            text: &e.to_string(),
+                            ..Default::default()
+                        },
                     )
                     .await?;
                 }
@@ -263,47 +189,6 @@ impl Service {
         }
         Ok(())
     }
-    async fn button(
-        &self,
-        target: &Conversation,
-        label: &str,
-        body: Value,
-    ) -> Result<(String, String)> {
-        Ok((label.into(), self.store.action(target, body).await?))
-    }
-    async fn answer_question_reply(&self, msg: &Inbound, id: &str) -> Result<()> {
-        let (_, req) = self.store.request(id).await.context(
-            "This question has expired or was already answered; reply to a current question",
-        )?;
-        anyhow::ensure!(
-            matches!(
-                req.kind,
-                RequestKind::Questions | RequestKind::AsyncQuestions
-            ),
-            "Use this card's buttons to choose a decision"
-        );
-        let draft = self
-            .drafts
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .unwrap_or_default();
-        anyhow::ensure!(
-            !draft.review,
-            "Select a question before replying with an answer"
-        );
-        let question = req
-            .questions
-            .get(draft.current)
-            .context("Question unavailable")?;
-        self.save_answer(
-            msg,
-            &json!({"request":id,"question":question.id}),
-            &msg.text,
-        )
-        .await
-    }
     fn project_name(&self, target: &Conversation) -> Result<&str> {
         self.ims
             .iter()
@@ -315,12 +200,12 @@ impl Service {
             .destination(project)
             .context("Agent is not available in this project")
     }
-    pub async fn initialize(&self) -> Result<()> {
+    pub(crate) async fn initialize_agent(&self, name: &str) -> Result<()> {
         let mut menu = vec![(
             "help",
             "Help · Show all commands and their categories".to_owned(),
         )];
-        for (category, commands) in [("Manage", MANAGEMENT_COMMANDS), ("Task", TASK_COMMANDS)] {
+        for (category, commands) in [("Project", MANAGEMENT_COMMANDS), ("Session", TASK_COMMANDS)] {
             menu.extend(
                 commands
                     .iter()
@@ -331,7 +216,8 @@ impl Service {
             .iter()
             .map(|(name, description)| (*name, description.as_str()))
             .collect();
-        for im in &self.ims {
+        let im = self.im(name)?;
+        {
             for target in im.spaces() {
                 let project = im
                     .project(&target)
@@ -348,6 +234,9 @@ impl Service {
                 tracing::warn!(%error, "Command menu update failed");
             }
         }
+        Ok(())
+    }
+    pub async fn initialize(&self) -> Result<()> {
         for binding in self.store.bindings().await?.1 {
             let project = self.project_name(&binding.target)?;
             anyhow::ensure!(
@@ -358,21 +247,33 @@ impl Service {
         Ok(())
     }
     async fn help(&self, agent: &str, target: &Conversation, key: &str) -> Result<()> {
-        let mut text = format!("Commands · {}", self.project_name(target)?);
+        let project = self.project_name(target)?;
+        let mut text = format!(
+            "Commands · {}\nDirectory: {}",
+            project,
+            self.cfg.projects[project].cwd.display()
+        );
         for (category, commands) in [
-            ("Management", MANAGEMENT_COMMANDS),
-            ("Current task", TASK_COMMANDS),
+            ("Project", MANAGEMENT_COMMANDS),
+            ("Current session", TASK_COMMANDS),
         ] {
             text.push_str(&format!("\n\n{category}"));
             for (_, usage, description) in commands {
                 text.push_str(&format!("\n{usage} — {description}"));
             }
         }
-        text.push_str("\n\n/help — Show this help in any topic\n\nTask commands use this topic's bound session. Ordinary messages start or steer its work. Manage bindings locally with uaoi bindings.");
-        text.push_str(
-            "\nUse /new@BotUsername <absolute directory> to select an agent in an unbound topic.",
-        );
-        self.notice_as(agent, target, key, &text).await
+        text.push_str("\n\n/help — Show this project's commands in any topic\n\n/new creates a session in this project's configured directory. With multiple online agents, use /new@BotUsername to choose one. In a session topic, /new uses that topic's agent.");
+        text.push_str("\nSession commands and ordinary messages use this topic's bound session. After /new or /agents, follow the topic link to work in that session. Manage bindings locally with uaoi bindings.");
+        self.output_as(
+            agent,
+            target,
+            key,
+            Message {
+                text: &text,
+                ..Default::default()
+            },
+        )
+        .await
     }
     async fn list_agents(
         &self,
@@ -381,14 +282,16 @@ impl Service {
         search: &str,
         active: bool,
     ) -> Result<()> {
-        let (_, bindings) = self.store.bindings().await?;
+        let bindings = self.store.bindings_in_space(&msg.target).await?;
         let mut text = format!("Sessions · {}\n", self.project_name(&msg.target)?);
         let mut links = vec![];
         let mut count = 0;
-        for binding in bindings.into_iter().filter(|b| {
-            b.target.space == msg.target.space && b.target.platform == msg.target.platform
-        }) {
-            let info = self.agent.describe(&binding.session).await;
+        for binding in bindings {
+            let info = if self.im(&binding.session.agent)?.enabled() {
+                self.agent.describe(&binding.session).await
+            } else {
+                Err(anyhow::anyhow!("Agent is offline"))
+            };
             let (title, state, cwd) = match info {
                 Ok(info) => (info.title, info.status, info.cwd.display().to_string()),
                 Err(_) => (
@@ -429,8 +332,17 @@ impl Service {
         if count == 0 {
             text.push_str("\nNo matching bound sessions.");
         }
-        self.output_linked_as(agent, &msg.target, &msg.id, &text, vec![], links)
-            .await
+        self.output_as(
+            agent,
+            &msg.target,
+            &msg.id,
+            Message {
+                text: &text,
+                links,
+                ..Default::default()
+            },
+        )
+        .await
     }
     async fn open_agent(&self, msg: &Inbound, session: &Session) -> Result<()> {
         let target = self
@@ -441,19 +353,58 @@ impl Service {
             .next()
             .context("Session topic unavailable")?;
         let text = self.store.title(session).await?;
-        self.output_linked_as(
+        self.output_as(
             &msg.agent,
             &msg.target,
             &msg.id,
-            &text,
-            vec![],
-            vec![TextLink {
-                start: 0,
-                end: text.len(),
-                url: self.im(&session.agent)?.link(&target),
-            }],
+            Message {
+                text: &text,
+                links: vec![TextLink {
+                    start: 0,
+                    end: text.len(),
+                    url: self.im(&session.agent)?.link(&target),
+                }],
+                ..Default::default()
+            },
         )
         .await
+    }
+    async fn show_status(&self, msg: &Inbound, agent: &str) -> Result<()> {
+        let project = self.project_name(&msg.target)?;
+        if let Some(session) = self.store.bound(&msg.target).await? {
+            anyhow::ensure!(session.agent == agent, "Session belongs to another agent");
+            let pending = self.store.unconsumed(&session.id).await?;
+            let status = self.agent.status(&session).await?;
+            self.output_as(agent, &msg.target, &msg.id, Message { text: &format!(
+                "Project: {}\nAgent: {}\nSession: {}\nCWD: {}\nMode (next turn): {}\nState: {}\nUnconfirmed inputs: {}",
+                project, session.agent, session.native, status.cwd.display(),
+                status.mode.map(SessionMode::label).unwrap_or("Unknown"), status.state,
+                pending.as_array().map_or(0, Vec::len)
+            ), ..Default::default() }).await
+        } else {
+            let spec = &self.cfg.projects[project];
+            let count = self.store.bindings_in_space(&msg.target).await?.len();
+            let agents = spec
+                .agents
+                .iter()
+                .map(|name| {
+                    format!(
+                        "{}: {}",
+                        name,
+                        if self.im(name).is_ok_and(|im| im.enabled()) {
+                            "online"
+                        } else {
+                            "offline"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.output_as(agent, &msg.target, &msg.id, Message { text: &format!(
+                "Project: {}\nDirectory: {}\nBound sessions: {}\nAgents:\n{}\n\nUse /new to create a session, or /agents to open an existing session's topic.",
+                project, spec.cwd.display(), count, agents
+            ), ..Default::default() }).await
+        }
     }
     async fn management_command(
         &self,
@@ -473,22 +424,22 @@ impl Service {
                 .await
             }
             "/new" => {
-                let path = std::path::Path::new(arg);
+                let project = self.project_name(&msg.target)?;
+                let spec = &self.cfg.projects[project];
+                let online = spec
+                    .agents
+                    .iter()
+                    .filter(|name| self.im(name).is_ok_and(|im| im.enabled()))
+                    .count();
                 anyhow::ensure!(
-                    !arg.is_empty() && path.is_absolute(),
-                    "Use /new <absolute directory>"
+                    msg.addressed || self.store.bound(&msg.target).await?.is_some() || online == 1,
+                    "Multiple agents are online. Use /new@BotUsername to choose one"
                 );
-                let cwd = std::fs::canonicalize(path).context("Working directory must exist")?;
-                anyhow::ensure!(cwd.is_dir(), "Working directory must be a directory");
-                anyhow::ensure!(
-                    msg.addressed || self.store.bound(&msg.target).await?.is_some(),
-                    "Choose an agent explicitly: /new@BotUsername <absolute directory>"
-                );
-                let (project, _) = self.cfg.project_for_cwd(agent, &cwd)?;
-                let session = self.agent.create(agent, &cwd).await?;
+                let session = self.agent.create(agent, &spec.cwd).await?;
                 self.ensure_topics_in(&session, project).await?;
                 self.open_agent(msg, &session).await
             }
+            "/status" => self.show_status(msg, agent).await,
             _ => anyhow::bail!("Unknown management command"),
         }
     }
@@ -516,6 +467,23 @@ impl Service {
         {
             return self.answer_question_reply(msg, id).await;
         }
+        if command == "/new" {
+            anyhow::ensure!(
+                arg.is_empty(),
+                "Use /new without arguments; the current group selects the project"
+            );
+        } else if matches!(command, "/status" | "/stop" | "/help") {
+            anyhow::ensure!(arg.is_empty(), "Use {command} without arguments");
+        }
+        if command.starts_with('/')
+            && command != "/help"
+            && !MANAGEMENT_COMMANDS
+                .iter()
+                .chain(TASK_COMMANDS)
+                .any(|(name, _, _)| command.strip_prefix('/') == Some(*name))
+        {
+            anyhow::bail!("Unknown command. Use /help to see this project's commands");
+        }
         if command == "/help" {
             return self.help(agent, &msg.target, &msg.id).await;
         }
@@ -530,24 +498,6 @@ impl Service {
         )?;
         anyhow::ensure!(session.agent == agent, "Session belongs to another agent");
         match command {
-            "/status" => {
-                let pending = self.store.unconsumed(&session.id).await?;
-                let status = self.agent.status(&session).await?;
-                self.notice(
-                    &msg.target,
-                    &msg.id,
-                    &format!(
-                        "Project: {}\nAgent: {}\nSession: {}\nCWD: {}\nMode (next turn): {}\nState: {}\nUnconfirmed inputs: {}",
-                        self.project_name(&msg.target)?, session.agent,
-                        session.native,
-                        status.cwd.display(),
-                        status.mode.map(SessionMode::label).unwrap_or("Unknown"),
-                        status.state,
-                        pending.as_array().map_or(0, Vec::len)
-                    ),
-                )
-                .await
-            }
             "/plan" | "/default" => {
                 let mode = if command == "/plan" {
                     SessionMode::Plan
@@ -577,12 +527,12 @@ impl Service {
                     .await
             }
             "/history" => {
-                self.agent.history(&session).await?;
                 let offset = if arg.is_empty() {
                     0
                 } else {
                     arg.parse::<usize>().context("Use /history [offset]")?
                 };
+                self.agent.history(&session).await?;
                 for e in self.store.history(&session.id, 20, offset).await? {
                     // Historical questions are text only: never recreate old controls.
                     self.notice(
@@ -599,298 +549,11 @@ impl Service {
                 )
                 .await
             }
-            c if c.starts_with('/') => {
-                anyhow::bail!("Unknown command. Use /help to see all commands")
-            }
             _ => {
                 anyhow::ensure!(!msg.text.is_empty(), "Only text input is supported");
                 self.submit_input(&session, &msg.text, &msg.id, None).await
             }
         }
-    }
-    async fn question_action(&self, msg: &Inbound, action: &Value) -> Result<()> {
-        let id = action["request"]
-            .as_str()
-            .context("Invalid question button")?;
-        let (sid, req) = self
-            .store
-            .request(id)
-            .await
-            .context("This question expired or was already answered")?;
-        let session = self
-            .store
-            .bound(&msg.target)
-            .await?
-            .context("Session unavailable")?;
-        anyhow::ensure!(sid == session.id, "Question belongs to another session");
-        anyhow::ensure!(
-            session.agent == msg.agent,
-            "This topic is controlled by agent {}",
-            session.agent
-        );
-        match action["op"].as_str().unwrap_or("") {
-            "decision" => {
-                self.agent
-                    .respond(
-                        &session,
-                        id,
-                        action["value"].as_str().context("Missing decision")?,
-                    )
-                    .await
-            }
-            "choice" => {
-                self.save_answer(
-                    msg,
-                    action,
-                    action["value"].as_str().context("Missing answer")?,
-                )
-                .await
-            }
-            "navigate" | "review" => {
-                let mut drafts = self.drafts.lock().await;
-                let draft = drafts.entry(id.into()).or_default();
-                anyhow::ensure!(
-                    !draft.submitting,
-                    "Answer submission is pending; check /status or /history"
-                );
-                if action["op"] == "navigate" {
-                    let current = action["question"].as_u64().context("Missing question")? as usize;
-                    anyhow::ensure!(current < req.questions.len(), "Unknown question");
-                    draft.current = current;
-                    draft.review = false;
-                } else {
-                    draft.review = true;
-                }
-                drop(drafts);
-                self.render_question(&session, &msg.target, &req).await
-            }
-            "submit" => {
-                let draft = self
-                    .drafts
-                    .lock()
-                    .await
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_default();
-                anyhow::ensure!(
-                    req.questions
-                        .iter()
-                        .all(|q| draft.answers.contains_key(&q.id)),
-                    "Answer every question before submitting"
-                );
-                self.submit_answers(msg, &session, &req, &draft.answers)
-                    .await
-            }
-            _ => anyhow::bail!("Unknown question action"),
-        }
-    }
-    async fn submit_answers(
-        &self,
-        msg: &Inbound,
-        session: &Session,
-        req: &PendingRequest,
-        answers: &BTreeMap<String, String>,
-    ) -> Result<()> {
-        {
-            let mut drafts = self.drafts.lock().await;
-            let draft = drafts.entry(req.id.clone()).or_default();
-            anyhow::ensure!(
-                !draft.submitting,
-                "Answer submission is pending; check /status or /history"
-            );
-            draft.submitting = true;
-        }
-        self.render_question(session, &msg.target, req).await?;
-        if let Err(error) = self
-            .agent
-            .respond(session, &req.id, &serde_json::to_string(answers)?)
-            .await
-        {
-            if !error.is::<crate::agent::OutcomeUnknown>() {
-                self.drafts
-                    .lock()
-                    .await
-                    .entry(req.id.clone())
-                    .or_default()
-                    .submitting = false;
-            }
-            self.render_question(session, &msg.target, req).await?;
-            return Err(error);
-        }
-        self.store.resolve(&req.id).await?;
-        self.drafts.lock().await.remove(&req.id);
-        self.notice(
-            &msg.target,
-            &format!("{}:request:{}", session.id, req.id),
-            &answer_summary(req, answers, "Answer submitted via Telegram"),
-        )
-        .await
-    }
-    async fn save_answer(&self, msg: &Inbound, action: &Value, text: &str) -> Result<()> {
-        let id = action["request"].as_str().context("Missing request")?;
-        let (sid, req) = self.store.request(id).await?;
-        let session = self
-            .store
-            .bound(&msg.target)
-            .await?
-            .context("Session unavailable")?;
-        anyhow::ensure!(sid == session.id, "Question belongs to another session");
-        anyhow::ensure!(
-            session.agent == msg.agent,
-            "This topic is controlled by agent {}",
-            session.agent
-        );
-        let q = req
-            .questions
-            .iter()
-            .find(|q| Some(q.id.as_str()) == action["question"].as_str())
-            .context("Unknown question")?;
-        anyhow::ensure!(!q.secret, "Answer sensitive questions in the CLI");
-        anyhow::ensure!(!text.trim().is_empty(), "Answer must not be empty");
-        {
-            let mut drafts = self.drafts.lock().await;
-            let draft = drafts.entry(id.into()).or_default();
-            anyhow::ensure!(
-                !draft.submitting,
-                "Answer submission is pending; check /status or /history"
-            );
-            draft.answers.insert(q.id.clone(), text.into());
-            draft.current = req
-                .questions
-                .iter()
-                .position(|question| question.id == q.id)
-                .unwrap_or(0);
-            draft.review = false;
-        }
-        self.render_question(&session, &msg.target, &req).await
-    }
-    async fn render_question(
-        &self,
-        s: &Session,
-        t: &Conversation,
-        req: &PendingRequest,
-    ) -> Result<()> {
-        let draft = self
-            .drafts
-            .lock()
-            .await
-            .get(&req.id)
-            .cloned()
-            .unwrap_or_default();
-        let status = if req.kind == RequestKind::AsyncQuestions {
-            "Task continues while you answer"
-        } else if req.blocking {
-            "Waiting for your answer"
-        } else {
-            "Optional question; the agent may clear it automatically"
-        };
-        let count = req.questions.len();
-        let answered = draft.answers.len();
-        let key = format!("{}:request:{}", s.id, req.id);
-        if draft.submitting {
-            return self
-                .notice(
-                    t,
-                    &key,
-                    &answer_summary(
-                        req,
-                        &draft.answers,
-                        "Answer submission pending; check /status or /history before retrying",
-                    ),
-                )
-                .await;
-        }
-        anyhow::ensure!(count > 0, "No questions to answer");
-        let mut rows = vec![];
-        if count > 1 || draft.review {
-            let mut navigation = vec![];
-            for (index, q) in req.questions.iter().enumerate() {
-                let label = format!(
-                    "{}{} {}",
-                    if !draft.review && draft.current == index {
-                        "• "
-                    } else {
-                        ""
-                    },
-                    index + 1,
-                    if draft.answers.contains_key(&q.id) {
-                        "✓"
-                    } else {
-                        "○"
-                    }
-                );
-                navigation.push(
-                    self.button(
-                        t,
-                        &label,
-                        json!({"op":"navigate","request":req.id,"question":index}),
-                    )
-                    .await?,
-                );
-            }
-            rows.extend(navigation.chunks(6).map(|row| row.to_vec()));
-        }
-        let text = if draft.review {
-            answer_summary(
-                req,
-                &draft.answers,
-                &format!("Review answers · {answered}/{count} answered\n{status}"),
-            )
-        } else {
-            let q = req
-                .questions
-                .get(draft.current)
-                .context("Question unavailable")?;
-            let mut text = format!(
-                "Question {}/{} · {answered}/{count} answered\n{status}\n\n{}",
-                draft.current + 1,
-                count,
-                shorten(&q.title, 1400)
-            );
-            if q.secret {
-                text.push_str("\n\nSensitive question: answer in the CLI.");
-            } else {
-                for (index, (label, description)) in q.options.iter().enumerate() {
-                    if !description.is_empty() {
-                        text.push_str(&format!(
-                            "\n{}. {} — {}",
-                            index + 1,
-                            shorten(label, 80),
-                            shorten(description, 180)
-                        ));
-                    }
-                    let selected = draft
-                        .answers
-                        .get(&q.id)
-                        .is_some_and(|answer| answer == label);
-                    rows.push(vec![
-                        self.button(
-                            t,
-                            &format!("{}{}", if selected { "✓ " } else { "" }, shorten(label, 80)),
-                            json!({"op":"choice","request":req.id,"question":q.id,"value":label}),
-                        )
-                        .await?,
-                    ]);
-                }
-                text.push_str(&format!("\n\nCurrent answer: {}\nReply to this message to write or replace this answer.",
-                    draft.answers.get(&q.id).map(|answer| shorten(answer, 600)).unwrap_or_else(|| "Not answered".into())));
-            }
-            text
-        };
-        if draft.review || count == 1 {
-            if answered == count {
-                rows.push(vec![
-                    self.button(t, "Submit answers", json!({"op":"submit","request":req.id}))
-                        .await?,
-                ]);
-            }
-        } else {
-            rows.push(vec![
-                self.button(t, "Review answers", json!({"op":"review","request":req.id}))
-                    .await?,
-            ]);
-        }
-        self.output_rows(t, &key, &shorten(&text, 3500), rows).await
     }
     async fn submit_input(
         &self,
@@ -950,6 +613,10 @@ impl Service {
         {
             return Ok(());
         }
+        anyhow::ensure!(
+            !self.store.was_bound(&s.id).await?,
+            "Session was unbound; manage its bindings explicitly"
+        );
         let key = format!("topic:{}:{}:{}", s.id, space.platform, space.space);
         anyhow::ensure!(
             self.store.claim(&key).await?,
@@ -983,10 +650,10 @@ impl Service {
                 topic: Some(record.target.thread),
             });
         }
-        Ok(json!({"document":BindingsDocument{version:2,revision,bindings},"titles":titles}))
+        Ok(json!({"document":BindingsDocument{version:3,revision,bindings},"titles":titles}))
     }
     pub(crate) async fn apply_bindings(&self, document: BindingsDocument) -> Result<()> {
-        anyhow::ensure!(document.version == 2, "Binding document version 2 required");
+        anyhow::ensure!(document.version == 3, "Binding document version 3 required");
         let _guard = self.binding_gate.lock().await;
         let (revision, old) = self.store.bindings().await?;
         anyhow::ensure!(
@@ -1029,12 +696,30 @@ impl Service {
                 );
                 targets.push(t.clone());
             }
-            prepared.push((entry, target));
+            let unchanged = old
+                .iter()
+                .find(|record| {
+                    record.session.agent == entry.agent
+                        && record.session.native == entry.session
+                        && target.as_ref() == Some(&record.target)
+                })
+                .cloned();
+            anyhow::ensure!(
+                unchanged.is_some() || self.im(&entry.agent)?.enabled(),
+                "Agent {} is offline; open uaoi --agent {} before changing its bindings",
+                entry.agent,
+                entry.agent
+            );
+            prepared.push((entry, target, unchanged));
         }
         // Validate every native session before allocating any remote topics.
         let mut resolved = vec![];
-        for (entry, target) in prepared {
-            let session = self.agent.restore(&entry.agent, &entry.session).await?;
+        for (entry, target, unchanged) in prepared {
+            let session = if let Some(record) = unchanged {
+                record.session
+            } else {
+                self.agent.restore(&entry.agent, &entry.session).await?
+            };
             resolved.push((session, entry.project, target));
         }
         let mut records = vec![];
@@ -1073,90 +758,6 @@ impl Service {
         }
         self.store.replace_bindings(revision, records).await
     }
-    pub(crate) async fn project(&self, e: &AgentEvent, t: &Conversation) -> Result<()> {
-        let lock = self.route_lock(t).await;
-        let _guard = lock.lock().await;
-        if self
-            .store
-            .bound(t)
-            .await?
-            .is_none_or(|session| session.id != e.session)
-        {
-            return Ok(());
-        }
-        if e.request.is_none()
-            && let Some(id) = e.key.strip_prefix("request:")
-        {
-            self.drafts.lock().await.remove(id);
-            return self
-                .notice(
-                    t,
-                    &format!("{}:{}", e.session, e.key),
-                    &shorten(&e.text, 1200),
-                )
-                .await;
-        }
-        if matches!(
-            e.kind,
-            EventKind::Registered | EventKind::Finished | EventKind::Offline
-        ) {
-            return Ok(());
-        }
-
-        if matches!(e.kind, EventKind::User)
-            && let Some(origin) = &e.origin
-            && self.store.origin(origin).await?.as_ref() == Some(t)
-        {
-            return Ok(());
-        }
-        let s = self.store.session(&e.session).await?;
-        if let Some(req) = &e.request {
-            if matches!(
-                req.kind,
-                RequestKind::Questions | RequestKind::AsyncQuestions
-            ) {
-                return self.render_question(&s, t, req).await;
-            }
-            let mut buttons = vec![];
-            for (label, value) in &req.choices {
-                buttons.push(
-                    self.button(
-                        t,
-                        label,
-                        json!({"op":"decision","request":req.id,"value":value}),
-                    )
-                    .await?,
-                );
-            }
-            return self
-                .output(t, &format!("{}:{}", e.session, e.key), &e.text, buttons)
-                .await;
-        }
-        let mode = self.cfg.agents[&s.agent].output;
-        if mode == OutputMode::Compact && matches!(e.kind, EventKind::Reasoning) {
-            return Ok(());
-        }
-        let (key, text) = if matches!(e.kind, EventKind::User) {
-            (
-                format!("{}:{}", e.session, e.key),
-                format!("You · CLI\n\n{}", e.text),
-            )
-        } else if mode == OutputMode::Compact && matches!(e.kind, EventKind::Tool) {
-            (
-                format!("{}:activity", s.id),
-                e.text
-                    .lines()
-                    .next()
-                    .unwrap_or("Working")
-                    .chars()
-                    .take(240)
-                    .collect(),
-            )
-        } else {
-            (format!("{}:{}", e.session, e.key), e.text.clone())
-        };
-        self.output(t, &key, &text, vec![]).await
-    }
     pub async fn events(
         self: Arc<Self>,
         mut rx: broadcast::Receiver<AgentEvent>,
@@ -1168,6 +769,7 @@ impl Service {
                 e=rx.recv()=>match e{
                     Ok(e)=>{let result:Result<()>=async{
                         let s=self.store.session(&e.session).await?;
+                        if !self.im(&s.agent)?.enabled() { return Ok(()); }
                     if matches!(e.kind, EventKind::Registered){
                         self.ensure_topics(&s).await?;
                     }
@@ -1182,7 +784,9 @@ impl Service {
     }
     pub(crate) async fn indicate_working(&self) -> Result<()> {
         for binding in self.store.bindings().await?.1 {
-            if self.agent.working(&binding.session).await {
+            if self.im(&binding.session.agent)?.enabled()
+                && self.agent.working(&binding.session).await
+            {
                 let target = binding.target;
                 if let Err(error) = self
                     .im(&binding.session.agent)?
@@ -1243,7 +847,11 @@ impl Service {
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         loop {
             tokio::select! {_=cancel.cancelled()=>break,_=tick.tick()=>{}}
-            let pending = match self.store.pending_titles().await {
+            let pending = match self
+                .store
+                .pending_titles_for(Some(self.active_agents()))
+                .await
+            {
                 Ok(p) => p,
                 Err(error) => {
                     tracing::error!(%error,"Read pending titles");
@@ -1258,7 +866,7 @@ impl Service {
                 if !self.store.title_is_current(&change).await.unwrap_or(false) {
                     continue;
                 }
-                let Ok(im) = self.im(&change.agent) else {
+                let Some(im) = self.im(&change.agent).ok().filter(|im| im.enabled()) else {
                     continue;
                 };
                 let outcome = tokio::select! {_=cancel.cancelled()=>return,r=im.rename_conversation(&change.target,&change.title)=>r};
@@ -1289,7 +897,8 @@ impl Service {
     pub async fn deliver(self: Arc<Self>, cancel: CancellationToken) {
         loop {
             tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(500))=>{}}
-            let batch = match self.store.pending().await {
+            let active = self.active_agents();
+            let batch = match self.store.pending_for(Some(active)).await {
                 Ok(v) => v,
                 Err(error) => {
                     tracing::error!(%error,"Read outbox");
@@ -1303,7 +912,7 @@ impl Service {
                 if cancel.is_cancelled() {
                     return;
                 }
-                let Ok(im) = self.im(&d.agent) else {
+                let Some(im) = self.im(&d.agent).ok().filter(|im| im.enabled()) else {
                     continue;
                 };
                 if self.store.delivery(&d, "sending", None).await.is_err() {
@@ -1361,56 +970,4 @@ fn shorten(text: &str, limit: usize) -> String {
         })
         .unwrap_or(text.len());
     format!("{}…", &text[..end])
-}
-
-fn answer_summary(
-    req: &PendingRequest,
-    answers: &BTreeMap<String, String>,
-    heading: &str,
-) -> String {
-    let mut text = heading.to_owned();
-    for (index, question) in req.questions.iter().enumerate() {
-        let answer = if question.secret {
-            "Answer in the CLI".into()
-        } else {
-            answers
-                .get(&question.id)
-                .map(|answer| shorten(answer, 600))
-                .unwrap_or_else(|| "Not answered".into())
-        };
-        text.push_str(&format!(
-            "\n\n{}. {}\n{}",
-            index + 1,
-            shorten(&question.title, 160),
-            answer
-        ));
-    }
-    shorten(&text, 3500)
-}
-
-pub(crate) fn split_output(mut text: &str) -> Vec<String> {
-    let mut chunks = vec![];
-    while !text.is_empty() {
-        let mut size = 0;
-        let mut end = text.len();
-        let mut newline = None;
-        for (i, c) in text.char_indices() {
-            if size + c.len_utf16() > 3500 {
-                end = i;
-                break;
-            }
-            size += c.len_utf16();
-            if c == '\n' {
-                newline = Some(i + 1);
-            }
-        }
-        if end < text.len()
-            && let Some(line) = newline
-        {
-            end = line;
-        }
-        chunks.push(text[..end].to_owned());
-        text = &text[end..];
-    }
-    chunks
 }

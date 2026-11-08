@@ -7,8 +7,8 @@ struct ProjectIm {
 }
 #[async_trait]
 impl ImAdapter for ProjectIm {
-    fn name(&self) -> &str {
-        &self.agent
+    fn name(&self) -> String {
+        self.agent.clone()
     }
     fn agent(&self) -> &str {
         &self.agent
@@ -52,9 +52,6 @@ impl ImAdapter for ProjectIm {
                 .destination(project)
                 .ok_or_else(|| anyhow::anyhow!("Unavailable project"))?
         })
-    }
-    fn authorized(&self, sender: &str, t: &Conversation) -> bool {
-        sender == "1" && self.project(t).is_some()
     }
     fn link(&self, t: &Conversation) -> String {
         format!("test:{}/{}", t.space, t.thread)
@@ -103,14 +100,11 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
         ProjectSpec {
             cwd: second.clone(),
             agents: vec!["work".into(), "personal".into()],
-            telegram: ProjectTelegram {
-                group: -1002,
-                allowed_users: vec![1],
-            },
+            telegram: ProjectTelegram { group: -1002 },
         },
     );
     let mut personal = cfg.agents["work"].clone();
-    personal.telegram.token_env = "PERSONAL_TOKEN".into();
+    personal.telegram.token_env = Some("PERSONAL_TOKEN".into());
     cfg.agents.insert("personal".into(), personal);
     let cfg = Arc::new(cfg);
     let work = Arc::new(ProjectIm {
@@ -189,6 +183,7 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
     wrong_bot.addressed = true;
     svc.handle(wrong_bot).await?;
     assert_eq!(agent.modes.lock().await[&c.id], SessionMode::Plan);
+    agent.described.lock().await.clear();
     let (first, second_msg) = receive_twice("shared-list", &tc, "/agents");
     svc.handle(second_msg).await?;
     svc.handle(first).await?;
@@ -202,6 +197,22 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
     assert!(list.text.contains("Project A") && list.text.contains("Personal C"));
     assert!(!list.text.contains("Project B"));
     assert_eq!(list.links.len(), 2);
+    let described = agent.described.lock().await.clone();
+    assert_eq!(described.len(), 2);
+    assert!(described.contains(&a.native) && described.contains(&c.native));
+    assert!(!described.contains(&b.native));
+    let general = work.destination("demo").unwrap();
+    svc.handle(message("project-overview", &general, "/status"))
+        .await?;
+    let overview = store
+        .pending()
+        .await?
+        .into_iter()
+        .find(|d| d.key == "project-overview:0")
+        .unwrap();
+    assert!(overview.text.contains("Project: demo") && overview.text.contains("Bound sessions: 2"));
+    assert!(!overview.text.contains("Project B"));
+
     let mut directed = message("directed-query", &tc, "/agents@PersonalBot");
     directed.agent = "personal".into();
     directed.addressed = true;
@@ -215,11 +226,7 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
     assert_eq!(directed.agent, "personal");
 
     let source = work.destination("demo").unwrap();
-    let (first, second_msg) = receive_twice(
-        "ambiguous-new",
-        &source,
-        &format!("/new {}", second.display()),
-    );
+    let (first, second_msg) = receive_twice("ambiguous-new", &source, "/new");
     svc.handle(first).await?;
     svc.handle(second_msg).await?;
     assert!(
@@ -248,11 +255,7 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
             .iter()
             .any(|v| v["op"] == "create")
     );
-    let mut create = message(
-        "explicit-new",
-        &source,
-        &format!("/new@PersonalBot {}", second.display()),
-    );
+    let mut create = message("explicit-new", &source, "/new@PersonalBot");
     create.agent = "personal".into();
     create.addressed = true;
     svc.handle(create).await?;
@@ -264,7 +267,10 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
         .find(|r| ![&a.id, &b.id, &c.id].contains(&&r.session.id))
         .unwrap();
     assert_eq!(new.session.agent, "personal");
-    assert_eq!(new.target.space, tb.space);
+    assert_eq!(new.target.space, source.space);
+    let calls = agent.management.lock().await.clone();
+    let creation = calls.iter().find(|call| call["op"] == "create").unwrap();
+    assert_eq!(creation["cwd"], dir.path().to_str().unwrap());
     let receipt = store
         .pending()
         .await?
@@ -295,6 +301,20 @@ async fn projects_share_agents_and_bots_dispatch_once_per_topic() -> Result<()> 
     restarted.initialize().await?;
     assert_eq!(reopened.bindings().await?.1.len(), 4);
     assert_eq!(reopened.targets(&a.id).await?[0].space, tb.space);
+    let wrong = message("owner-new", &tc, "/new");
+    let mut owner = wrong.clone();
+    owner.agent = "personal".into();
+    restarted.handle(wrong).await?;
+    restarted.handle(owner).await?;
+    let records = reopened.bindings().await?.1;
+    assert_eq!(records.len(), 5);
+    let latest = records
+        .iter()
+        .find(|r| ![&a.id, &b.id, &c.id, &new.session.id].contains(&&r.session.id))
+        .unwrap();
+    assert_eq!(latest.session.agent, "personal");
+    assert_eq!(latest.target.space, tc.space);
+
     Ok(())
 }
 
@@ -340,7 +360,7 @@ async fn removing_binding_disables_old_question_buttons_and_replies() -> Result<
     let token = card_action(&card, "Blue");
     let (revision, _) = store.bindings().await?;
     svc.apply_bindings(BindingsDocument {
-        version: 2,
+        version: 3,
         revision,
         bindings: vec![],
     })

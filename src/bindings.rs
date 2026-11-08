@@ -1,7 +1,7 @@
 use crate::{config::Config, model::BindingsDocument, wrapper};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::{io::Write, path::Path};
+use std::io::Write;
 
 fn render(snapshot: &Value) -> Result<String> {
     let document: BindingsDocument = serde_json::from_value(snapshot["document"].clone())?;
@@ -29,8 +29,8 @@ fn render(snapshot: &Value) -> Result<String> {
     Ok(text)
 }
 
-pub async fn edit(cfg: &Config, config_path: &Path) -> Result<()> {
-    let mut connection = wrapper::connect(cfg, config_path).await?;
+pub async fn edit(cfg: &Config) -> Result<()> {
+    let mut connection = wrapper::connect(cfg).await?;
     let snapshot = wrapper::request(
         &mut connection,
         json!({"method":"bindings","fingerprint":cfg.fingerprint()}),
@@ -69,7 +69,7 @@ pub async fn edit(cfg: &Config, config_path: &Path) -> Result<()> {
             "Do not edit the binding document version or revision"
         );
         // Reconnect after editing: the broker may close idle control connections.
-        let mut connection = wrapper::connect(cfg, config_path).await?;
+        let mut connection = wrapper::connect(cfg).await?;
         wrapper::request(
             &mut connection,
             json!({"method":"bindings/apply","fingerprint":cfg.fingerprint(),"document":document}),

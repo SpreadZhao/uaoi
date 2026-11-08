@@ -139,7 +139,6 @@ pub struct Inbound {
     pub agent: String,
     pub addressed: bool,
     pub id: String,
-    pub sender: String,
     pub target: Conversation,
     pub text: String,
     pub conversation_created: bool,
