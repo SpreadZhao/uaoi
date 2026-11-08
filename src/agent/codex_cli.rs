@@ -4,6 +4,28 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Options whose following token is a value, even when it starts with a dash.
+const VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-C",
+    "--cd",
+    "-s",
+    "--sandbox",
+    "--add-dir",
+    "-a",
+    "--ask-for-approval",
+];
+
 // Interpret only launcher routing options; Codex remains the argument validator.
 pub fn invocation(args: &[OsString], base: &Path) -> Result<(bool, PathBuf)> {
     let mut cwd = base.to_owned();
@@ -47,27 +69,7 @@ pub fn invocation(args: &[OsString], base: &Path) -> Result<(bool, PathBuf)> {
                 a.strip_prefix("--cd=")
                     .unwrap_or(a[2..].strip_prefix('=').unwrap_or(&a[2..])),
             );
-        } else if !positional
-            && [
-                "-c",
-                "--config",
-                "--enable",
-                "--disable",
-                "-i",
-                "--image",
-                "-m",
-                "--model",
-                "--local-provider",
-                "-p",
-                "--profile",
-                "-s",
-                "--sandbox",
-                "--add-dir",
-                "-a",
-                "--ask-for-approval",
-            ]
-            .contains(&a.as_ref())
-        {
+        } else if !positional && VALUE_OPTIONS.contains(&a.as_ref()) {
             i += 1;
         } else if !positional && !a.starts_with('-') && command.is_none() {
             command = Some(a.to_string());
@@ -251,24 +253,7 @@ pub fn remote_arguments(args: &[OsString]) -> Result<(Vec<OsString>, Permissions
             // Preserve option values as a unit; a prompt/model beginning with -s
             // or -a is not a permission option.
             tui.push(args[i].clone());
-            if [
-                "-c",
-                "--config",
-                "--enable",
-                "--disable",
-                "-i",
-                "--image",
-                "-m",
-                "--model",
-                "--local-provider",
-                "-p",
-                "--profile",
-                "-C",
-                "--cd",
-                "--add-dir",
-            ]
-            .contains(&arg.as_ref())
-            {
+            if VALUE_OPTIONS.contains(&arg.as_ref()) {
                 i += 1;
                 tui.push(args.get(i).context("Missing option value")?.clone());
             }
