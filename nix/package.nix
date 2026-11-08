@@ -1,4 +1,8 @@
-{ lib, rustPlatform }:
+{
+  lib,
+  rustPlatform,
+  python3,
+}:
 rustPlatform.buildRustPackage {
   pname = "uaoi";
   version = "0.1.0";
@@ -8,8 +12,10 @@ rustPlatform.buildRustPackage {
       ../Cargo.toml
       ../Cargo.lock
       ../src
+      ../tests
     ];
   };
+  nativeCheckInputs = [ python3 ];
   cargoLock.lockFile = ../Cargo.lock;
   meta = {
     description = "Control coding agents from IM and their native terminal";
